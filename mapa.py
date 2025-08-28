@@ -1,31 +1,18 @@
-# mapa_empresas_json.py
-# Gera APENAS um JSON com empresas + lat/lon (sem HTML).
-# Requisitos: pandas, geopy
-# pip install pandas geopy
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# mapa.py — Gera APENAS um JSON com empresas + lat/lon (sem HTML).
 #
 # Exemplo:
-#   python mapa_empresas_json.py \
+#   python mapa.py \
 #     --base empresas_tecnologia_sao_carlos_ativas.csv \
 #     --enriched empresas_tecnologia_sc_ativas_com_socios.csv \
 #     --geocache geocache_enderecos.csv \
 #     --out-json empresas_tecnologia_sao_carlos.json \
-#     --city "São Carlos" --uf "SP" --max-geocode 200
+#     --city "São Carlos" --uf "SP" \
+#     --user-agent "empresas-mapper/1.0 (contact: seu-email@exemplo.com)" \
+#     --max-geocode 200 --keep-missing
 #
-# Caso típico (São Carlos/SP)
-# python mapa_empresas_json.py \
-#   --base empresas_tecnologia_sao_carlos_ativas.csv \
-#   --enriched empresas_tecnologia_sc_ativas_com_socios.csv \
-#   --geocache geocache_enderecos.csv \
-#   --out-json empresas_tecnologia_sao_carlos.json \
-#   --city "São Carlos" --uf "SP"
-
-# Teste com limite de geocodificações novas e mantendo itens sem coordenada no JSON
-# python mapa_empresas_json.py \
-#   --base empresas_tecnologia_sao_carlos_ativas.csv \
-#   --out-json empresas_tecnologia_sao_carlos.json \
-#   --city "São Carlos" --uf "SP" \
-#   --max-geocode 100 --keep-missing
-
 import argparse
 import json
 import re
@@ -68,7 +55,7 @@ def load_base(path: Path) -> pd.DataFrame:
     return df
 
 def load_enriched_optional(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
+    if not path or not path.exists():
         return None
     df = pd.read_csv(path, dtype=str, keep_default_na=False)
     if "cnpj" not in df.columns:
@@ -130,10 +117,7 @@ def build_enriched_index(df_enr: pd.DataFrame, max_socios_in_json: int = 20) -> 
         if not isinstance(socios_list, (list, tuple)):
             socios_list = []
         n_soc = len(socios_list)
-        if n_soc > max_socios_in_json:
-            socios_short = socios_list[:max_socios_in_json]
-        else:
-            socios_short = socios_list
+        socios_short = socios_list[:max_socios_in_json] if n_soc > max_socios_in_json else socios_list
         porte = s(row.get("porte_empresa_txt")) or s(row.get("porte_empresa"))
         out[str(cnpj)] = {
             "porte": porte,
@@ -223,7 +207,7 @@ def geocode_with_candidates(geocode, candidates):
 
 def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
                       user_agent: str, cidade: str, uf: str,
-                      max_geocode: int | None) -> pd.DataFrame:
+                      max_geocode: int | None) -> tuple[pd.DataFrame, pd.DataFrame]:
     geolocator = Nominatim(user_agent=user_agent, timeout=10)
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)  # respeita 1 req/s
 
@@ -280,8 +264,10 @@ def main():
                     help="User-Agent para Nominatim (coloque um contato válido).")
     ap.add_argument("--max-geocode", type=int, default=None, help="Limite de endereços novos para geocodificar (teste).")
     ap.add_argument("--keep-missing", action="store_true",
-                    help="Se indicado, mantém itens sem lat/lon no JSON; caso contrário, exclui.")
+                    help="Mantém itens sem lat/lon no JSON (por padrão, são removidos).")
     args = ap.parse_args()
+
+    keep_missing = getattr(args, "keep_missing", False)  # <- FIX do bug do argparse
 
     base_path = Path(args.base)
     enr_path = Path(args.enriched) if args.enriched else None
@@ -304,11 +290,9 @@ def main():
         cidade=args.city, uf=args.uf, max_geocode=args.max_geocode
     )
 
-    # sempre persistimos o cache atualizado
     print("5) Salvando cache…")
     save_geocache(geocache, cache_path)
 
-    # monta JSON
     print("6) Gerando JSON…")
     data = {
         "meta": {
@@ -323,15 +307,14 @@ def main():
         "features": []
     }
 
-    rows = df_geo.itertuples(index=False)
-    for r in rows:
-        cnpj = s(getattr(r, "cnpj"))
-        nome = s(getattr(r, "nome"))
-        endereco = s(getattr(r, "endereco"))
-        lat = s(getattr(r, "latitude"))
-        lon = s(getattr(r, "longitude"))
+    for _, r in df_geo.iterrows():
+        cnpj = s(r["cnpj"])
+        nome = s(r.get("nome"))
+        endereco = s(r.get("endereco"))
+        lat = s(r.get("latitude"))
+        lon = s(r.get("longitude"))
 
-        if not args.keep-missing and (lat == "" or lon == ""):
+        if (not keep_missing) and (lat == "" or lon == ""):
             continue
 
         item = {
@@ -341,11 +324,9 @@ def main():
             "endereco": endereco,
             "latitude": float(lat) if lat else None,
             "longitude": float(lon) if lon else None,
-            # depuração: query usada no cache (igual ao endereço base aqui)
-            "query_geocode": s(getattr(r, "query", "")),
+            "query_geocode": s(r.get("query", "")),
         }
 
-        # adiciona enriquecidos se houver
         if cnpj in enr_idx:
             info = enr_idx[cnpj]
             item.update({
@@ -359,7 +340,6 @@ def main():
         data["features"].append(item)
 
     data["meta"]["count_output"] = len(data["features"])
-
     out_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"JSON salvo em: {out_json}  (itens: {data['meta']['count_output']})")
 
