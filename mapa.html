@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>Mapa de Empresas (JSON)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <!-- MarkerCluster CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"
+  />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"
+  />
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+    header {
+      padding: .6rem .9rem; background: #0f172a; color: #e2e8f0;
+      display: flex; gap: .75rem; align-items: center; flex-wrap: wrap;
+    }
+    header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+    header .meta { font-size: .85rem; opacity: .85; }
+    header .spacer { flex: 1 1 auto; }
+    header .btn {
+      background: #334155; color: #e2e8f0; border: 0; border-radius: .5rem;
+      padding: .5rem .8rem; cursor: pointer;
+    }
+    header .btn:hover { background: #475569; }
+    #map { width: 100%; height: 100%; }
+    #fileInput { display: none; }
+    .legend {
+      position: absolute; z-index: 500; right: 12px; top: 72px;
+      background: #ffffff; border: 1px solid #e5e7eb; border-radius: .5rem;
+      box-shadow: 0 4px 16px rgba(2,6,23,.08);
+      padding: .5rem .75rem; font-size: .85rem; color: #0f172a;
+    }
+    .legend b { font-weight: 600; }
+    .popup {
+      font-size: 13px; line-height: 1.25rem;
+    }
+    .popup .title { font-weight: 700; margin-bottom: .25rem; }
+    .popup .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .popup .socios { margin-top: .25rem; }
+    .popup .socios li { margin-left: .8rem; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Mapa de Empresas</h1>
+      <div class="meta" id="metaText">—</div>
+      <div class="spacer"></div>
+      <button class="btn" id="btnReload">Recarregar</button>
+      <button class="btn" id="btnLoadFile">Carregar JSON…</button>
+      <input type="file" id="fileInput" accept=".json,application/json" />
+    </header>
+    <div style="position:relative">
+      <div id="map"></div>
+      <div class="legend" id="legend">
+        <div><b>Total (JSON):</b> <span id="totalJson">0</span></div>
+        <div><b>Plotados:</b> <span id="totalPlot">0</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <!-- MarkerCluster JS -->
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <script>
+    // ======== Config =========
+    const DEFAULT_JSON = "empresas_tecnologia_sao_carlos.json"; // mude se quiser
+    const GOOGLE_LINK = (lat, lon) =>
+      `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+
+    // ======== Helpers =========
+    function getParam(name, fallback = null) {
+      const params = new URLSearchParams(location.search);
+      return params.get(name) ?? fallback;
+    }
+
+    function esc(str) {
+      return String(str ?? "").replace(/[&<>"']/g, m => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      })[m]);
+    }
+
+    function popupHtml(item) {
+      const title = esc(item.razao_social || item.nome || "—");
+      const cnpj = esc(item.cnpj_formatado || item.cnpj || "");
+      const end  = esc(item.endereco || "");
+      const porte = esc(item.porte || "");
+      const cap   = esc(item.capital_social || "");
+      const lat   = item.latitude, lon = item.longitude;
+      const socios = Array.isArray(item.socios) ? item.socios : [];
+      const nSoc = Number(item.n_socios || socios.length || 0);
+
+      const link = (lat != null && lon != null) ? (
+        `<a href="${GOOGLE_LINK(lat, lon)}" target="_blank">Abrir no Google Maps</a>`
+      ) : "";
+
+      const sociosBlock = nSoc
+        ? `<div class="socios"><b>Sócios (${nSoc}):</b><ul>${
+            socios.slice(0, 10).map(s => `<li>${esc(s)}</li>`).join("")
+          }${nSoc > 10 ? `<li>… (+${nSoc-10} mais)</li>` : ""}</ul></div>`
+        : "";
+
+      return `
+        <div class="popup">
+          <div class="title">${title}</div>
+          ${cnpj ? `<div>CNPJ: <span class="mono">${cnpj}</span></div>` : ""}
+          ${porte ? `<div>Porte: ${porte}</div>` : ""}
+          ${cap ? `<div>Capital social: ${cap}</div>` : ""}
+          ${end ? `<div>Endereço: ${end}</div>` : ""}
+          ${link ? `<div style="margin-top:.25rem">${link}</div>` : ""}
+          ${sociosBlock}
+        </div>
+      `;
+    }
+
+    function makeMap() {
+      const map = L.map("map", {
+        center: [-22.01, -47.89], // centro aproximado (São Carlos)
+        zoom: 12,
+        preferCanvas: true
+      });
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
+      }).addTo(map);
+
+      // Cluster com chunkedLoading para performance
+      const cluster = L.markerClusterGroup({
+        chunkedLoading: true,
+        chunkDelay: 50,
+        chunkInterval: 200,
+        spiderfyOnMaxZoom: true,
+        showCoverageOnHover: false
+      });
+      map.addLayer(cluster);
+
+      return { map, cluster };
+    }
+
+    async function loadJsonFromUrl(url) {
+      const resp = await fetch(url, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`Falha ao carregar JSON: ${resp.status}`);
+      return await resp.json();
+    }
+
+    function loadJsonFromFile(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onerror = () => reject(new Error("Erro ao ler arquivo"));
+        r.onload = () => {
+          try { resolve(JSON.parse(r.result)); }
+          catch (e) { reject(e); }
+        };
+        r.readAsText(file, "utf-8");
+      });
+    }
+
+    function applyDataToMap(data, mapObj) {
+      const { map, cluster } = mapObj;
+      const feats = Array.isArray(data?.features) ? data.features : [];
+      document.getElementById("totalJson").textContent = feats.length;
+
+      const bounds = [];
+      let plotted = 0;
+
+      for (const item of feats) {
+        const lat = item.latitude, lon = item.longitude;
+        if (lat == null || lon == null) continue;
+
+        const m = L.marker([lat, lon]);
+        m.bindPopup(popupHtml(item), { maxWidth: 380, minWidth: 220 });
+        cluster.addLayer(m);
+        bounds.push([lat, lon]);
+        plotted++;
+      }
+
+      document.getElementById("totalPlot").textContent = plotted;
+
+      if (bounds.length) {
+        try {
+          map.fitBounds(bounds, { padding: [30, 30] });
+        } catch {}
+      }
+    }
+
+    async function boot() {
+      const { map, cluster } = makeMap();
+      const mapObj = { map, cluster };
+      const metaText = document.getElementById("metaText");
+      const btnReload = document.getElementById("btnReload");
+      const btnLoadFile = document.getElementById("btnLoadFile");
+      const fileInput = document.getElementById("fileInput");
+
+      const jsonParam = getParam("data", DEFAULT_JSON);
+
+      async function tryFetchDefault() {
+        try {
+          const data = await loadJsonFromUrl(jsonParam);
+          applyDataToMap(data, mapObj);
+          const meta = data?.meta || {};
+          metaText.textContent = `Fonte: ${meta.source_base ?? "—"} | Itens: ${data?.meta?.count_output ?? data?.features?.length ?? 0}`;
+        } catch (e) {
+          metaText.textContent = `Falha ao carregar '${jsonParam}'. Use "Carregar JSON…"`;
+          console.warn(e);
+        }
+      }
+
+      btnReload.addEventListener("click", tryFetchDefault);
+      btnLoadFile.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async (ev) => {
+        const file = ev.target.files?.[0];
+        if (!file) return;
+        // limpa o cluster anterior
+        cluster.clearLayers();
+        document.getElementById("totalPlot").textContent = "0";
+        try {
+          const data = await loadJsonFromFile(file);
+          applyDataToMap(data, mapObj);
+          const meta = data?.meta || {};
+          metaText.textContent = `Arquivo: ${esc(file.name)} | Itens: ${data?.meta?.count_output ?? data?.features?.length ?? 0}`;
+        } catch (e) {
+          alert("Não foi possível ler o JSON selecionado.");
+          console.error(e);
+        } finally {
+          fileInput.value = "";
+        }
+      });
+
+      await tryFetchDefault();
+    }
+
+    boot();
+  </script>
+</body>
+</html>
