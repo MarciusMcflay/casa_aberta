@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# mapa.py — Gera APENAS um JSON com empresas + lat/lon (sem HTML).
+# mapa.py — Gera APENAS um JSON com empresas + lat/lon (sem HTML),
+#           com LOG detalhado de falhas de geocodificação.
 #
 # Exemplo:
 #   python mapa.py \
@@ -9,6 +10,8 @@
 #     --enriched empresas_tecnologia_sc_ativas_com_socios.csv \
 #     --geocache geocache_enderecos.csv \
 #     --out-json empresas_tecnologia_sao_carlos.json \
+#     --log-failures geocode_failures.csv \
+#     --debug-candidates geocode_attempts.jsonl \
 #     --city "São Carlos" --uf "SP" \
 #     --user-agent "empresas-mapper/1.0 (contact: seu-email@exemplo.com)" \
 #     --max-geocode 200 --keep-missing
@@ -66,20 +69,12 @@ def load_enriched_optional(path: Path) -> Optional[pd.DataFrame]:
     return df
 
 def build_enriched_index(df_enr: Optional[pd.DataFrame], max_socios_in_json: int = 20) -> Dict[str, Any]:
-    """
-    Índice por CNPJ com:
-      - porte (porte_empresa_txt ou porte_empresa)
-      - capital_social
-      - razao_social (se houver)
-      - lista de sócios (até max_socios_in_json) + contagem total
-    """
     if df_enr is None or df_enr.empty:
         return {}
     df_enr = df_enr.copy()
     df_enr["cnpj"] = df_enr["cnpj"].astype(str)
 
     cols = set(df_enr.columns)
-    # agrega lista de sócios (se existir)
     if "nome_socio_razao_social" in cols:
         socios_grp = (
             df_enr[["cnpj", "nome_socio_razao_social"]]
@@ -148,12 +143,6 @@ _PREFIXES = [
 ]
 
 def normalize_for_geocode(endereco_raw: str) -> Tuple[str, Optional[str]]:
-    """
-    - Insere espaço após prefixos (RUAJOSE -> RUA JOSE)
-    - Remove ' - NN/UF - ' (ex.: ' - 16/SP - ')
-    - Extrai CEP e remove do texto
-    - Limpa espaços/pontuação
-    """
     if not endereco_raw:
         return "", None
     t = str(endereco_raw).upper().strip()
@@ -164,24 +153,24 @@ def normalize_for_geocode(endereco_raw: str) -> Tuple[str, Optional[str]]:
     # normaliza 'KM    148,8' -> 'KM 148,8'
     t = re.sub(r'\bKM\s*([0-9]+[,\.]?[0-9]*)', r'KM \1', t)
 
+    # remove bloco ' - NN/UF - '
     t = re.sub(r'\s*-\s*\d{2}\s*/\s*[A-Z]{2}\s*-?', ' ', t)
 
+    # extrai CEP
     mcep = re.search(r'CEP\s*([0-9]{5}-?[0-9]{3})', t)
     cep: Optional[str] = None
     if mcep:
         cep = mcep.group(1)
         t = t[:mcep.start()] + t[mcep.end():]
 
+    # limpeza final
     t = t.replace(' - ', ', ')
     t = re.sub(r'\s*,\s*', ', ', t)
     t = re.sub(r'\s{2,}', ' ', t).strip(' ,;-')
     return t, cep
 
-# ================== Geocodificação ROBUSTA ==================
+# ================== Geocodificação ROBUSTA + LOG ==================
 def fetch_city_bbox(geolocator: Nominatim, city: str, uf: str, country: str = "Brasil") -> Optional[Tuple[float, float, float, float]]:
-    """
-    Busca bounding box de 'city/uf' e retorna (west, south, east, north).
-    """
     loc = geolocator.geocode(
         {"city": city, "state": uf, "country": country},
         addressdetails=True, exactly_one=True, country_codes="br"
@@ -203,16 +192,15 @@ def point_in_bbox(lat: float, lon: float, bbox: Optional[Tuple[float, float, flo
 def _addr_city_like(addr: Dict[str, str]) -> str:
     return addr.get("city") or addr.get("town") or addr.get("municipality") or addr.get("village") or ""
 
-def is_valid_hit(loc, city_expect: str, uf_expect: str, bbox: Optional[Tuple[float, float, float, float]]) -> bool:
+def validate_hit(loc, city_expect: str, uf_expect: str, bbox: Optional[Tuple[float, float, float, float]]) -> Tuple[bool, str]:
     raw = getattr(loc, "raw", {}) or {}
     addr = raw.get("address", {}) or {}
 
-    # rejeita boundary administrativo (centroide de cidade/município)
     if (raw.get("class") == "boundary") and (raw.get("type") in {"administrative", "city", "town", "municipality"}):
-        return False
+        return False, "reject:boundary-centroid"
 
     if addr.get("country_code", "").lower() != "br":
-        return False
+        return False, f"reject:country={addr.get('country_code','')}"
 
     city_hit = _addr_city_like(addr)
     state_code = (addr.get("state_code") or "").upper()
@@ -220,37 +208,37 @@ def is_valid_hit(loc, city_expect: str, uf_expect: str, bbox: Optional[Tuple[flo
 
     ok_city = city_expect.upper() in city_hit.upper()
     ok_uf = (uf_expect.upper() == state_code) or (uf_expect.upper() in state)
-    if not (ok_city and ok_uf):
-        return False
+    if not ok_city or not ok_uf:
+        return False, f"reject:addr_mismatch city='{city_hit}' state='{state_code or state}'"
 
     try:
         lat = float(loc.latitude); lon = float(loc.longitude)
     except Exception:
-        return False
+        return False, "reject:invalid_latlon"
 
-    return point_in_bbox(lat, lon, bbox)
+    if not point_in_bbox(lat, lon, bbox):
+        return False, "reject:outside_bbox"
+
+    return True, "ok"
+
+def describe_candidate(q: Any) -> str:
+    if isinstance(q, dict):
+        return "dict:" + json.dumps(q, ensure_ascii=False, sort_keys=True)
+    return "str:" + str(q)
 
 def build_candidates(endereco_raw: str, cidade: str, uf: str, country: str = "Brasil") -> List[Any]:
-    """
-    Retorna candidatos priorizando consultas estruturadas.
-    """
     base, cep = normalize_for_geocode(endereco_raw)
     cands: List[Any] = []
 
-    # 1) Estruturado com street + postalcode (melhor precisão)
     if base and cep:
         cands.append({"street": base, "city": cidade, "state": uf, "country": country, "postalcode": cep})
-    # 2) Estruturado só com street
     if base:
         cands.append({"street": base, "city": cidade, "state": uf, "country": country})
-    # 3) Estruturado só com CEP
     if cep:
         cands.append({"postalcode": cep, "city": cidade, "state": uf, "country": country})
-    # 4) Livre como fallback
     if base:
         cands.append(f"{base}, {cidade}, {uf}, {country}")
 
-    # de-dup mantendo ordem
     seen = set(); uniq: List[Any] = []
     for q in cands:
         key = json.dumps(q, ensure_ascii=False, sort_keys=True) if isinstance(q, dict) else str(q)
@@ -260,39 +248,42 @@ def build_candidates(endereco_raw: str, cidade: str, uf: str, country: str = "Br
 
 def geocode_with_candidates(geocode, candidates: List[Any],
                             bbox: Optional[Tuple[float, float, float, float]],
-                            cidade: str, uf: str) -> Tuple[str, str]:
-    """
-    Tenta cada candidato com restrição de país/área e validação city/UF.
-    """
-    # geopy espera viewbox como ((south, west), (north, east))
+                            cidade: str, uf: str) -> Tuple[str, str, List[Dict[str, str]]]:
+    attempts: List[Dict[str, str]] = []
     vb = None
     if bbox:
         west, south, east, north = bbox
-        vb = ((south, west), (north, east))
+        vb = ((south, west), (north, east))  # ((S,W),(N,E))
 
     for q in candidates:
+        desc = describe_candidate(q)
         try:
-            if isinstance(q, dict):
-                loc = geocode(q, exactly_one=True, addressdetails=True,
-                              country_codes="br",
-                              viewbox=vb, bounded=bool(vb))
+            loc = geocode(q, exactly_one=True, addressdetails=True,
+                          country_codes="br",
+                          viewbox=vb, bounded=bool(vb))
+            if not loc:
+                attempts.append({"candidate": desc, "result": "no_hit"})
+                continue
+            ok, reason = validate_hit(loc, cidade, uf, bbox)
+            if ok:
+                attempts.append({"candidate": desc, "result": "ok"})
+                return f"{loc.latitude}", f"{loc.longitude}", attempts
             else:
-                loc = geocode(q, exactly_one=True, addressdetails=True,
-                              country_codes="br",
-                              viewbox=vb, bounded=bool(vb))
-            if loc and is_valid_hit(loc, cidade, uf, bbox):
-                return f"{loc.latitude}", f"{loc.longitude}"
-        except Exception:
+                attempts.append({"candidate": desc, "result": reason})
+        except Exception as e:
+            attempts.append({"candidate": desc, "result": f"exception:{type(e).__name__}"})
             continue
-    return "", ""
+
+    return "", "", attempts
 
 def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
                       user_agent: str, cidade: str, uf: str,
-                      max_geocode: Optional[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                      max_geocode: Optional[int],
+                      log_failures_path: Path,
+                      debug_attempts_path: Optional[Path]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     geolocator = Nominatim(user_agent=user_agent, timeout=10)
-    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)  # respeita 1 req/s
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
 
-    # captura bbox da cidade uma única vez
     bbox = fetch_city_bbox(geolocator, city=cidade, uf=uf, country="Brasil")
     if not bbox:
         print("Aviso: não consegui obter bounding box da cidade; seguindo sem restrição espacial.")
@@ -304,6 +295,13 @@ def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
     geocache["query"] = geocache["query"].astype(str)
     cache_map = dict(zip(geocache["query"], zip(geocache["latitude"], geocache["longitude"])))
 
+    # prepara arquivos de log
+    if not log_failures_path.exists():
+        pd.DataFrame(columns=["query","reason","attempts"]).to_csv(log_failures_path, index=False)
+    debug_fp = None
+    if debug_attempts_path:
+        debug_fp = open(debug_attempts_path, "a", encoding="utf-8")
+
     pend = df_base[~df_base["query"].isin(cache_map.keys())]["query"].drop_duplicates().tolist()
     print(f"Endereços a geocodificar: {len(pend)} (em cache: {len(cache_map)})")
     if max_geocode is not None:
@@ -312,27 +310,55 @@ def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
 
     novos = []
     ok, falhas = 0, 0
+    fail_rows = []
+
     for i, q in enumerate(pend, 1):
         cands = build_candidates(q, cidade=cidade, uf=uf, country="Brasil")
-        lat, lon = geocode_with_candidates(geocode, cands, bbox, cidade, uf)
+        lat, lon, attempts = geocode_with_candidates(geocode, cands, bbox, cidade, uf)
+
+        # log detalhado (debug opcional)
+        if debug_fp:
+            debug_fp.write(json.dumps({
+                "query": q,
+                "attempts": attempts
+            }, ensure_ascii=False) + "\n")
+
         if lat and lon:
             ok += 1
         else:
             falhas += 1
+            # razão prioritária (primeiro motivo não "no_hit")
+            reason = "no_hit_all"
+            for a in attempts:
+                if a["result"] != "no_hit":
+                    reason = a["result"]; break
+            fail_rows.append({
+                "query": q,
+                "reason": reason,
+                "attempts": json.dumps(attempts, ensure_ascii=False)
+            })
+
         novos.append({"query": q, "latitude": lat, "longitude": lon})
 
+        # flush periódico
         if i % 50 == 0:
-            tmp = pd.DataFrame(novos)
-            if not tmp.empty:
-                geocache = pd.concat([geocache, tmp], ignore_index=True)
+            if fail_rows:
+                pd.DataFrame(fail_rows).to_csv(log_failures_path, mode="a", header=False, index=False)
+                fail_rows = []
+            if novos:
+                geocache = pd.concat([geocache, pd.DataFrame(novos)], ignore_index=True)
                 novos = []
-                print(f"[{i}/{len(pend)}] resolvidos: {ok} | falhas: {falhas} | cache parcial…")
+            print(f"[{i}/{len(pend)}] resolvidos: {ok} | falhas: {falhas} | cache/log parcial…")
 
+    # flush final
+    if fail_rows:
+        pd.DataFrame(fail_rows).to_csv(log_failures_path, mode="a", header=False, index=False)
     if novos:
         geocache = pd.concat([geocache, pd.DataFrame(novos)], ignore_index=True)
+    if debug_fp:
+        debug_fp.close()
 
     print(f"Geocodificação concluída. Sucesso: {ok} | Falhas: {falhas}")
-
     cache_map = dict(zip(geocache["query"], zip(geocache["latitude"], geocache["longitude"])))
     df_base[["latitude", "longitude"]] = df_base["query"].map(cache_map).apply(pd.Series)
     return df_base, geocache
@@ -344,6 +370,8 @@ def main():
     ap.add_argument("--enriched", default=None, help="CSV enriquecido opcional (ex.: *_com_socios.csv).")
     ap.add_argument("--geocache", default="geocache_enderecos.csv", help="CSV de cache de geocodificação.")
     ap.add_argument("--out-json", required=True, help="Caminho do JSON de saída.")
+    ap.add_argument("--log-failures", default="geocode_failures.csv", help="CSV de falhas de geocodificação.")
+    ap.add_argument("--debug-candidates", default=None, help="(opcional) JSONL com tentativas por endereço.")
     ap.add_argument("--city", default="São Carlos", help="Cidade a forçar na geocodificação (default: São Carlos).")
     ap.add_argument("--uf", default="SP", help="UF a forçar na geocodificação (default: SP).")
     ap.add_argument("--user-agent", default="empresas-mapper/1.0 (contact: seu-email@exemplo.com)",
@@ -353,12 +381,14 @@ def main():
                     help="Mantém itens sem lat/lon no JSON (por padrão, são removidos).")
     args = ap.parse_args()
 
-    keep_missing = getattr(args, "keep_missing", False)  # fix argparse
+    keep_missing = getattr(args, "keep_missing", False)
 
     base_path = Path(args.base)
     enr_path = Path(args.enriched) if args.enriched else None
     cache_path = Path(args.geocache)
     out_json = Path(args.out_json)
+    log_failures = Path(args.log_failures)
+    debug_attempts = Path(args.debug_candidates) if args.debug_candidates else None
 
     print("1) Lendo base…")
     base = load_base(base_path)
@@ -373,7 +403,8 @@ def main():
     print("4) Geocodificando…")
     df_geo, geocache = geocode_addresses(
         base, geocache, user_agent=args.user_agent,
-        cidade=args.city, uf=args.uf, max_geocode=args.max_geocode
+        cidade=args.city, uf=args.uf, max_geocode=args.max_geocode,
+        log_failures_path=log_failures, debug_attempts_path=debug_attempts
     )
 
     print("5) Salvando cache…")
@@ -428,6 +459,9 @@ def main():
     data["meta"]["count_output"] = len(data["features"])
     out_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"JSON salvo em: {out_json}  (itens: {data['meta']['count_output']})")
+    print(f"Falhas registradas em: {log_failures}")
+    if debug_attempts:
+        print(f"Tentativas detalhadas (debug) em: {debug_attempts}")
 
 if __name__ == "__main__":
     main()
