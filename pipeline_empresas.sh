@@ -36,6 +36,10 @@ HTTP_PORT=8000
 USE_VENV=1
 VENV_DIR=".venv"
 
+# 8) flags de controle da geocodificação:
+KEEP_MISSING_JSON=0      # 1 = mantém itens sem lat/lon no JSON
+MAX_GEOCODE=""           # ex.: 500 para testes; vazio = sem limite
+
 #####################################
 # Funções utilitárias
 #####################################
@@ -54,6 +58,7 @@ if ! need_cmd curl;  then sudo apt-get update && sudo apt-get install -y curl;  
 if ! need_cmd unzip; then sudo apt-get update && sudo apt-get install -y unzip; fi
 if ! need_cmd python3; then sudo apt-get update && sudo apt-get install -y python3; fi
 if ! need_cmd pip3;    then sudo apt-get update && sudo apt-get install -y python3-pip; fi
+if ! need_cmd lsof; then sudo apt-get update && sudo apt-get install -y lsof; fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
   if [[ ! -d "$VENV_DIR" ]]; then
@@ -88,7 +93,7 @@ PYCHK
 then
   log "Instalando dependências Python (pandas, geopy, folium)…"
   $PIP -q install --upgrade pip
-  $PIP -q install pandas geopy folium
+  $PIP -q install pandas geopy
 else
   log "Dependências Python já presentes — OK"
 fi
@@ -245,6 +250,10 @@ if [[ -s "$JSON_OUT" ]]; then
   log "P5 já existe ($JSON_OUT) — pulando geocodificação."
 else
   log "P5: mapa.py (gera JSON) → $JSON_OUT"
+
+  KEEP_FLAG=(); [[ "$KEEP_MISSING_JSON" -eq 1 ]] && KEEP_FLAG+=(--keep-missing)
+  MAX_FLAG=(); [[ -n "${MAX_GEOCODE:-}" ]] && MAX_FLAG+=(--max-geocode "$MAX_GEOCODE")
+
   $PY mapa.py \
     --base "$OUT_STEP2" \
     --enriched "$OUT_STEP4" \
@@ -252,7 +261,10 @@ else
     --out-json "$JSON_OUT" \
     --city "${CITIES[0]}" \
     --uf "$UF" \
-    --user-agent "$USER_AGENT"
+    --user-agent "$USER_AGENT" \
+    "${KEEP_FLAG[@]}" \
+    "${MAX_FLAG[@]}"
+
 fi
 
 #####################################

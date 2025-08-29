@@ -18,6 +18,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
 from geopy.geocoders import Nominatim
@@ -54,7 +55,7 @@ def load_base(path: Path) -> pd.DataFrame:
     df = df[df["endereco"] != ""].copy()
     return df
 
-def load_enriched_optional(path: Path) -> pd.DataFrame | None:
+def load_enriched_optional(path: Path) -> Optional[pd.DataFrame]:
     if not path or not path.exists():
         return None
     df = pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -64,7 +65,7 @@ def load_enriched_optional(path: Path) -> pd.DataFrame | None:
     df = df[df["cnpj"].str.len() == 14].copy()
     return df
 
-def build_enriched_index(df_enr: pd.DataFrame, max_socios_in_json: int = 20) -> dict:
+def build_enriched_index(df_enr: Optional[pd.DataFrame], max_socios_in_json: int = 20) -> Dict[str, Any]:
     """
     Índice por CNPJ com:
       - porte (porte_empresa_txt ou porte_empresa)
@@ -111,7 +112,7 @@ def build_enriched_index(df_enr: pd.DataFrame, max_socios_in_json: int = 20) -> 
     base_grp = df_enr.groupby("cnpj").agg(agg) if agg else pd.DataFrame(index=df_enr["cnpj"].unique())
     enr = base_grp.join(socios_grp, how="left")
 
-    out = {}
+    out: Dict[str, Any] = {}
     for cnpj, row in enr.iterrows():
         socios_list = row.get("socios_list", [])
         if not isinstance(socios_list, (list, tuple)):
@@ -146,7 +147,7 @@ _PREFIXES = [
     "PRAÇA","PRACA","LARGO","VIA","VIELA","SERVIDAO","SERVIDÃO","PARQUE"
 ]
 
-def normalize_for_geocode(endereco_raw: str):
+def normalize_for_geocode(endereco_raw: str) -> Tuple[str, Optional[str]]:
     """
     - Insere espaço após prefixos (RUAJOSE -> RUA JOSE)
     - Remove ' - NN/UF - ' (ex.: ' - 16/SP - ')
@@ -160,10 +161,13 @@ def normalize_for_geocode(endereco_raw: str):
     for p in _PREFIXES:
         t = re.sub(rf'\b{p}(?=[A-Z0-9])', f'{p} ', t)
 
+    # normaliza 'KM    148,8' -> 'KM 148,8'
+    t = re.sub(r'\bKM\s*([0-9]+[,\.]?[0-9]*)', r'KM \1', t)
+
     t = re.sub(r'\s*-\s*\d{2}\s*/\s*[A-Z]{2}\s*-?', ' ', t)
 
     mcep = re.search(r'CEP\s*([0-9]{5}-?[0-9]{3})', t)
-    cep = None
+    cep: Optional[str] = None
     if mcep:
         cep = mcep.group(1)
         t = t[:mcep.start()] + t[mcep.end():]
@@ -173,33 +177,110 @@ def normalize_for_geocode(endereco_raw: str):
     t = re.sub(r'\s{2,}', ' ', t).strip(' ,;-')
     return t, cep
 
-def build_candidates(endereco_raw: str, cidade: str, uf: str):
+# ================== Geocodificação ROBUSTA ==================
+def fetch_city_bbox(geolocator: Nominatim, city: str, uf: str, country: str = "Brasil") -> Optional[Tuple[float, float, float, float]]:
+    """
+    Busca bounding box de 'city/uf' e retorna (west, south, east, north).
+    """
+    loc = geolocator.geocode(
+        {"city": city, "state": uf, "country": country},
+        addressdetails=True, exactly_one=True, country_codes="br"
+    )
+    if not loc:
+        return None
+    bb = (loc.raw or {}).get("boundingbox")
+    if not bb or len(bb) != 4:
+        return None
+    south, north, west, east = map(float, bb)  # nominatim: [south, north, west, east]
+    return (west, south, east, north)
+
+def point_in_bbox(lat: float, lon: float, bbox: Optional[Tuple[float, float, float, float]]) -> bool:
+    if not bbox:
+        return True
+    west, south, east, north = bbox
+    return (south <= lat <= north) and (west <= lon <= east)
+
+def _addr_city_like(addr: Dict[str, str]) -> str:
+    return addr.get("city") or addr.get("town") or addr.get("municipality") or addr.get("village") or ""
+
+def is_valid_hit(loc, city_expect: str, uf_expect: str, bbox: Optional[Tuple[float, float, float, float]]) -> bool:
+    raw = getattr(loc, "raw", {}) or {}
+    addr = raw.get("address", {}) or {}
+
+    # rejeita boundary administrativo (centroide de cidade/município)
+    if (raw.get("class") == "boundary") and (raw.get("type") in {"administrative", "city", "town", "municipality"}):
+        return False
+
+    if addr.get("country_code", "").lower() != "br":
+        return False
+
+    city_hit = _addr_city_like(addr)
+    state_code = (addr.get("state_code") or "").upper()
+    state = (addr.get("state") or "").upper()
+
+    ok_city = city_expect.upper() in city_hit.upper()
+    ok_uf = (uf_expect.upper() == state_code) or (uf_expect.upper() in state)
+    if not (ok_city and ok_uf):
+        return False
+
+    try:
+        lat = float(loc.latitude); lon = float(loc.longitude)
+    except Exception:
+        return False
+
+    return point_in_bbox(lat, lon, bbox)
+
+def build_candidates(endereco_raw: str, cidade: str, uf: str, country: str = "Brasil") -> List[Any]:
+    """
+    Retorna candidatos priorizando consultas estruturadas.
+    """
     base, cep = normalize_for_geocode(endereco_raw)
-    cidade_fix = cidade
-    uf_fix = uf
-    pais_fix = "Brasil"
+    cands: List[Any] = []
 
-    candidates = []
+    # 1) Estruturado com street + postalcode (melhor precisão)
+    if base and cep:
+        cands.append({"street": base, "city": cidade, "state": uf, "country": country, "postalcode": cep})
+    # 2) Estruturado só com street
     if base:
-        candidates.append(f"{base}, {cidade_fix}, {uf_fix}, {pais_fix}")
-        rua = base.split(',')[0].strip()
-        if rua and rua != base:
-            candidates.append(f"{rua}, {cidade_fix}, {uf_fix}, {pais_fix}")
+        cands.append({"street": base, "city": cidade, "state": uf, "country": country})
+    # 3) Estruturado só com CEP
     if cep:
-        candidates.append(f"{cep}, {cidade_fix}, {uf_fix}, {pais_fix}")
+        cands.append({"postalcode": cep, "city": cidade, "state": uf, "country": country})
+    # 4) Livre como fallback
+    if base:
+        cands.append(f"{base}, {cidade}, {uf}, {country}")
 
-    seen, uniq = set(), []
-    for q in candidates:
-        if q not in seen:
-            uniq.append(q)
-            seen.add(q)
+    # de-dup mantendo ordem
+    seen = set(); uniq: List[Any] = []
+    for q in cands:
+        key = json.dumps(q, ensure_ascii=False, sort_keys=True) if isinstance(q, dict) else str(q)
+        if key not in seen:
+            uniq.append(q); seen.add(key)
     return uniq
 
-def geocode_with_candidates(geocode, candidates):
+def geocode_with_candidates(geocode, candidates: List[Any],
+                            bbox: Optional[Tuple[float, float, float, float]],
+                            cidade: str, uf: str) -> Tuple[str, str]:
+    """
+    Tenta cada candidato com restrição de país/área e validação city/UF.
+    """
+    # geopy espera viewbox como ((south, west), (north, east))
+    vb = None
+    if bbox:
+        west, south, east, north = bbox
+        vb = ((south, west), (north, east))
+
     for q in candidates:
         try:
-            loc = geocode(q)
-            if loc:
+            if isinstance(q, dict):
+                loc = geocode(q, exactly_one=True, addressdetails=True,
+                              country_codes="br",
+                              viewbox=vb, bounded=bool(vb))
+            else:
+                loc = geocode(q, exactly_one=True, addressdetails=True,
+                              country_codes="br",
+                              viewbox=vb, bounded=bool(vb))
+            if loc and is_valid_hit(loc, cidade, uf, bbox):
                 return f"{loc.latitude}", f"{loc.longitude}"
         except Exception:
             continue
@@ -207,9 +288,14 @@ def geocode_with_candidates(geocode, candidates):
 
 def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
                       user_agent: str, cidade: str, uf: str,
-                      max_geocode: int | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                      max_geocode: Optional[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     geolocator = Nominatim(user_agent=user_agent, timeout=10)
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)  # respeita 1 req/s
+
+    # captura bbox da cidade uma única vez
+    bbox = fetch_city_bbox(geolocator, city=cidade, uf=uf, country="Brasil")
+    if not bbox:
+        print("Aviso: não consegui obter bounding box da cidade; seguindo sem restrição espacial.")
 
     df_base = df_base.copy()
     df_base["query"] = df_base["endereco"].astype(str)
@@ -227,8 +313,8 @@ def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
     novos = []
     ok, falhas = 0, 0
     for i, q in enumerate(pend, 1):
-        cands = build_candidates(q, cidade=cidade, uf=uf)
-        lat, lon = geocode_with_candidates(geocode, cands)
+        cands = build_candidates(q, cidade=cidade, uf=uf, country="Brasil")
+        lat, lon = geocode_with_candidates(geocode, cands, bbox, cidade, uf)
         if lat and lon:
             ok += 1
         else:
@@ -267,7 +353,7 @@ def main():
                     help="Mantém itens sem lat/lon no JSON (por padrão, são removidos).")
     args = ap.parse_args()
 
-    keep_missing = getattr(args, "keep_missing", False)  # <- FIX do bug do argparse
+    keep_missing = getattr(args, "keep_missing", False)  # fix argparse
 
     base_path = Path(args.base)
     enr_path = Path(args.enriched) if args.enriched else None
@@ -294,7 +380,7 @@ def main():
     save_geocache(geocache, cache_path)
 
     print("6) Gerando JSON…")
-    data = {
+    data: Dict[str, Any] = {
         "meta": {
             "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "source_base": str(base_path),
@@ -317,7 +403,7 @@ def main():
         if (not keep_missing) and (lat == "" or lon == ""):
             continue
 
-        item = {
+        item: Dict[str, Any] = {
             "cnpj": cnpj,
             "cnpj_formatado": format_cnpj(cnpj),
             "nome": nome,
