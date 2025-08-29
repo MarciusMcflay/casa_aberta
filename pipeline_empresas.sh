@@ -4,7 +4,7 @@ set -euo pipefail
 #####################################
 # CONFIGURÁVEIS
 #####################################
-CITIES=("São Carlos")
+CITIES=("São Carlos")          # pode listar várias: ("São Carlos" "Araraquara")
 UF="SP"
 
 CNAES=("6201501" "6201502" "6202300" "6203100" "6204000" "6209100" \
@@ -24,9 +24,11 @@ GEOCACHE="geocache_enderecos.csv"
 
 HTTP_PORT=8000
 
-# Passe 1 para manter empresas sem coordenada no JSON
-KEEP_MISSING_JSON=0
+# Controle do JSON do mapa
+KEEP_MISSING_JSON=0          # 1 = mantém itens sem lat/lon no JSON; 0 = descarta
+MAX_GEOCODE=""               # ex.: "200" para limitar novos geocodes; "" = sem limite
 
+# Ambiente Python
 USE_VENV=1
 VENV_DIR=".venv"
 
@@ -44,25 +46,49 @@ join_by() { local IFS="$1"; shift; echo "$*"; }
 # 0) Dependências
 #####################################
 log "Checando dependências…"
-if ! need_cmd curl;  then sudo apt-get update && sudo apt-get install -y curl;  fi
-if ! need_cmd unzip; then sudo apt-get update && sudo apt-get install -y unzip; fi
-if ! need_cmd python3; then sudo apt-get update && sudo apt-get install -y python3; fi
-if ! need_cmd pip3;    then sudo apt-get update && sudo apt-get install -y python3-pip; fi
+sudo apt-get update -y
+
+# binários usados pelo script
+for pkg in curl unzip wget lsof python3 python3-pip; do
+  if ! need_cmd "$pkg"; then
+    sudo apt-get install -y "$pkg" || true
+  fi
+done
+
+# Garante ensurepip/venv para a MESMA versão do python3
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+  pyver="$(python3 -V | awk '{print $2}' | cut -d. -f1,2)"   # ex.: 3.10, 3.12
+  log "Instalando python3-venv e python${pyver}-venv…"
+  sudo apt-get install -y python3-venv "python${pyver}-venv" || true
+fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
+  # Se existir venv quebrado (sem pip), remove e recria
+  if [[ -d "$VENV_DIR" ]] && [[ ! -x "$VENV_DIR/bin/pip" ]]; then
+    warn "Venv existente sem pip — removendo $VENV_DIR…"
+    rm -rf "$VENV_DIR"
+  fi
+
   [[ -d "$VENV_DIR" ]] || python3 -m venv "$VENV_DIR"
+
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    err "Falha ao criar venv em $VENV_DIR. Verifique se 'python3-venv' e 'pythonX.Y-venv' foram instalados."
+    exit 1
+  fi
+
   # shellcheck disable=SC1090
   source "$VENV_DIR/bin/activate"
   PY=python
   PIP=pip
+
+  $PIP -q install --upgrade pip setuptools wheel
 else
   PY=python3
   PIP=pip3
 fi
 
 log "Instalando libs Python…"
-$PIP -q install --upgrade pip
-$PIP -q install pandas geopy folium
+$PIP -q install --upgrade pandas geopy folium
 
 #####################################
 # 1) Baixar/extrair da Receita (mês mais recente)
@@ -151,7 +177,8 @@ else
   log "P1: filtro_cidades_ativas.py → $OUT_STEP1"
   CITY_ARGS=()
   for c in "${CITIES[@]}"; do CITY_ARGS+=("-c" "$c"); done
-  $PY filtro_cidades_ativas.py "${CITY_ARGS[@]}" --uf "$UF" --out "$OUT_STEP1" --chunksize "$CHUNKSIZE" --engine auto
+  # NOTA: não passamos --engine porque pode não existir no seu .py
+  $PY filtro_cidades_ativas.py "${CITY_ARGS[@]}" --uf "$UF" --out "$OUT_STEP1" --chunksize "$CHUNKSIZE"
 fi
 
 if [[ -s "$OUT_STEP2" ]]; then
@@ -177,12 +204,17 @@ else
   $PY merge_socios.py --in "$OUT_STEP3" --out "$OUT_STEP4" --chunksize "$CHUNKSIZE"
 fi
 
+# P5: Gera JSON com mapa.py (sem HTML)
 if [[ -s "$JSON_OUT" ]]; then
   log "P5 já existe ($JSON_OUT) — pulando geocodificação."
 else
   log "P5: mapa.py (gera JSON) → $JSON_OUT"
   KEEP_FLAG=()
   [[ "$KEEP_MISSING_JSON" -eq 1 ]] && KEEP_FLAG=(--keep-missing)
+
+  MAX_FLAG=()
+  [[ -n "${MAX_GEOCODE}" ]] && MAX_FLAG=(--max-geocode "$MAX_GEOCODE")
+
   $PY mapa.py \
     --base "$OUT_STEP2" \
     --enriched "$OUT_STEP4" \
@@ -191,7 +223,8 @@ else
     --city "${CITIES[0]}" \
     --uf "$UF" \
     --user-agent "$USER_AGENT" \
-    "${KEEP_FLAG[@]}"
+    "${KEEP_FLAG[@]}" \
+    "${MAX_FLAG[@]}"
 fi
 
 #####################################
@@ -214,7 +247,13 @@ sleep 1
 
 URL="http://localhost:${HTTP_PORT}/mapa.html?data=$(printf '%s' "$JSON_OUT" | sed 's/ /%20/g')"
 log "Abrindo navegador: $URL"
-if command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 || true; else echo "$URL"; fi
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$URL" >/dev/null 2>&1 || true
+else
+  warn "xdg-open não disponível. Abra manualmente: $URL"
+  echo "$URL"
+fi
 
 log "Pipeline concluído."
+trap '[[ -n "${SERV_PID:-}" ]] && kill ${SERV_PID} >/dev/null 2>&1 || true' EXIT
 wait $SERV_PID || true
