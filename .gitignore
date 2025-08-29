@@ -1,0 +1,77 @@
+# =========================
+# Python (bytecode / caches)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+htmlcov/
+
+# =========================
+# Virtualenvs
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# SO / Temporários
+# =========================
+.DS_Store
+Thumbs.db
+*.log
+nohup.out
+tmp/
+*.tmp
+
+# ===========================================
+# Datasets da Receita (baixados/extraídos)
+# (mantém só os .py e o mapa.html no repo)
+# ===========================================
+*.zip
+K*.ESTABELE*
+K*.EMPRECSV*
+K*.SOCIOCSV*
+*MUNICCSV*
+*CNAECSV*
+*QUALSCSV*
+*PAISCSV*
+
+# ===========================================
+# Artefatos gerados pelo pipeline
+# (CSV/JSON/cache de geocodificação)
+# ===========================================
+# Bases filtradas/derivadas
+empresas_*.csv
+*_filtradas*.csv
+*_filtrados*.csv
+*_enriquecidas*.csv
+*_com_socios*.csv
+
+# Cache de geocodificação
+geocache_enderecos*.csv
+
+# Saída JSON do mapa
+empresas_tecnologia_*.json
+
+# Formatos alternativos (caso exporte)
+*.parquet
+*.feather
+
+# =========================
+# Web (manter o viewer)
+# =========================
+# NÃO ignore o mapa.html (viewer estático)
+# (não há regra para *.html)
