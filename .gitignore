@@ -48,6 +48,9 @@ K*.SOCIOCSV*
 *CNAECSV*
 *QUALSCSV*
 *PAISCSV*
+*NATJUCSV*
+*MOTICSV*
+*SIMPLES.CSV*
 
 # ===========================================
 # Artefatos gerados pelo pipeline
