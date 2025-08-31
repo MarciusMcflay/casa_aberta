@@ -41,6 +41,7 @@ tmp/
 # (mantém só os .py e o mapa.html no repo)
 # ===========================================
 *.zip
+*.7z
 K*.ESTABELE*
 K*.EMPRECSV*
 K*.SOCIOCSV*
@@ -64,10 +65,10 @@ empresas_*.csv
 *_com_socios*.csv
 
 # Cache de geocodificação
-geocache_enderecos*.csv
+#geocache_enderecos*.csv
 
 # Saída JSON do mapa
-empresas_tecnologia_*.json
+#empresas_tecnologia_*.json
 
 # Formatos alternativos (caso exporte)
 *.parquet
