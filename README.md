@@ -1,8 +1,8 @@
-# Casa Aberta — SENAC
+# FILTRO DE EMPRESAS POR CNAE
 
 ## Extração, filtragem e enriquecimento de dados públicos do CNPJ
 
-Este repositório traz um projeto demonstrativo do **Casa Aberta do SENAC** para analisar o ecossistema de **empresas de tecnologia de São Carlos (SP)** com base nos **Dados Abertos do CNPJ** (Receita Federal do Brasil). A arquitetura é **modular, robusta e extensível**, permitindo replicar o pipeline para **qualquer cidade/UF** e **qualquer conjunto de CNAEs** (não apenas tecnologia), com enriquecimentos adicionais a partir dos arquivos oficiais.
+Este repositório traz um projeto demonstrativo pela primeira vez no **Casa Aberta do SENAC** para analisar o ecossistema de **empresas de tecnologia de São Carlos (SP)** com base nos **Dados Abertos do CNPJ** (Receita Federal do Brasil). A arquitetura é **modular, robusta e extensível**, permitindo replicar o pipeline para **qualquer cidade/UF** e **qualquer conjunto de CNAEs** (não apenas tecnologia), com enriquecimentos adicionais a partir dos arquivos oficiais.
 
 ---
 
