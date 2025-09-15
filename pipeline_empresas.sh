@@ -48,26 +48,51 @@ warn(){ printf "\e[1;33m[WARN]\e[0m %s\n" "$*"; }
 err() { printf "\e[1;31m[ERRO]\e[0m %s\n" "$*" >&2; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Comando '$1' não encontrado."; return 1; }; }
-join_by() { local IFS="$1"; shift; echo "$*"; }  # Normaliza lista em string
+
+# acha AAAA-MM -> AAAAMM
+yyyymm_from_month_url() {
+  local murl="$1"
+  local seg="${murl%/}"; seg="${seg##*/}"     # 2025-09
+  echo "${seg/-/}"                            # 202509
+}
+
+# checa se já tem arquivos extraídos/normalizados para um grupo
+has_group() {
+  local key="$1"
+  shopt -s nullglob
+  case "$key" in
+    ESTABELE) comp=(K*.ESTABELE* Estabelecimentos*.csv) ;;
+    EMPRECSV) comp=(K*.EMPRECSV* Empresas*.csv) ;;
+    SOCIOCSV) comp=(K*.SOCIOCSV* Socios*.csv) ;;
+    MUNICCSV) comp=(*MUNIC* Municipios*.csv) ;;
+    CNAECSV)  comp=(*CNAECSV* Cnaes*.csv) ;;
+    QUALSCSV) comp=(*QUALSCSV* Qualificacoes*.csv) ;;
+    PAISCSV)  comp=(*PAISCSV* Paises*.csv) ;;
+    *) return 1 ;;
+  esac
+  for f in "${comp[@]}"; do [[ -s "$f" ]] && return 0; done
+  return 1
+}
 
 #####################################
 # 0) Checagens e dependências (só instala se faltar)
 #####################################
 log "Checando dependências de sistema…"
-if ! need_cmd curl;  then sudo apt-get update && sudo apt-get install -y curl;  fi
-if ! need_cmd unzip; then sudo apt-get update && sudo apt-get install -y unzip; fi
+for pkg in curl unzip wget lsof; do
+  if ! need_cmd "$pkg"; then
+    sudo apt-get update && sudo apt-get install -y "$pkg"
+  fi
+done
+
 if ! need_cmd python3; then sudo apt-get update && sudo apt-get install -y python3; fi
 if ! need_cmd pip3;    then sudo apt-get update && sudo apt-get install -y python3-pip; fi
-if ! need_cmd lsof; then sudo apt-get update && sudo apt-get install -y lsof; fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
   if [[ ! -d "$VENV_DIR" ]]; then
     log "Criando venv em $VENV_DIR…"
-    # trata ensurepip ausente (python3-venv)
     if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
       warn "python3-venv ausente — instalando…"
       sudo apt-get update
-      # tenta instalar venv genérico e o venv específico da versão
       sudo apt-get install -y python3-venv || true
       PYVER="$(python3 -V | awk '{print $2}' | cut -d. -f1,2)"
       sudo apt-get install -y "python${PYVER}-venv" || true
@@ -93,123 +118,170 @@ PYCHK
 then
   log "Instalando dependências Python (pandas, geopy, folium)…"
   $PIP -q install --upgrade pip
-  $PIP -q install pandas geopy
+  $PIP -q install pandas geopy folium
 else
   log "Dependências Python já presentes — OK"
 fi
 
 #####################################
-# 1) Verificar se datasets já existem (curto-circuito)
+# 1) Verificar/baixar da Receita (SÓ se faltar algo)
 #####################################
-# Verifica se já existe algum arquivo extraído (não .zip) para um grupo
-has_extracted() {
-  local key="$1"
-  local comp
-  case "$key" in
-    ESTABELE) comp='K*.ESTABELE*';;
-    EMPRECSV) comp='K*.EMPRECSV*';;
-    SOCIOCSV) comp='K*.SOCIOCSV*';;
-    MUNICCSV) comp='*MUNICCSV*';;
-    CNAECSV)  comp='*CNAECSV*';;
-    QUALSCSV) comp='*QUALSCSV*';;
-    PAISCSV)  comp='*PAISCSV*';;
-    *) return 1;;
-  esac
-  shopt -s nullglob
-  for f in $comp; do
-    [[ "$f" == *.zip ]] && continue
-    [[ -s "$f" ]] && return 0
-  done
-  return 1
+BASE_URL="https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj"
+
+# Função que imprime **apenas** a URL do mês mais recente (AAAA-MM/)
+get_latest_month_url() {
+  curl -fsSL "$BASE_URL/" \
+    | grep -Eo 'href="20[0-9]{2}-[01][0-9]/"' \
+    | sed -E 's/^href="|\/"$//g' \
+    | sort -u \
+    | sort \
+    | tail -n 1 \
+    | awk -v base="$BASE_URL" '{print base "/" $0 "/"}'
 }
 
-all_datasets_present() {
-  local required=(ESTABELE EMPRECSV SOCIOCSV MUNICCSV CNAECSV QUALSCSV)
-  for k in "${required[@]}"; do
-    if ! has_extracted "$k"; then
-      return 1
-    fi
-  done
-  # PAISCSV é opcional — não entra no required
-  return 0
-}
-
-#####################################
-# 1.a) Baixar/extrair da Receita SÓ se faltar algo
-#####################################
-if all_datasets_present; then
-  log "Todos os datasets necessários já estão extraídos na pasta — pulando downloads."
+if has_group ESTABELE && has_group EMPRECSV && has_group SOCIOCSV \
+   && has_group MUNICCSV && has_group CNAECSV && has_group QUALSCSV; then
+  log "Todos os datasets necessários já estão presentes — pulando downloads."
+  MONTH_URL="$(get_latest_month_url)" || MONTH_URL="$BASE_URL/"
 else
-  BASE_URL="https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj"
-
-  # Função: escolhe URL do mês mais recente
-  get_latest_month_url() {
-    log "Descobrindo pasta do mês mais recente em $BASE_URL…"
-    local months
-    months="$(curl -fsSL "$BASE_URL/" | grep -Eo 'href="20[0-9]{2}-[01][0-9]/"' | sed -E 's/^href="|\/"$//g' | sort -u || true)"
-    if [[ -z "$months" ]]; then
-      err "Não foi possível listar os meses em $BASE_URL/ (verifique rede/DNS)."
-      exit 1
-    fi
-    local latest
-    latest="$(echo "$months" | sort | tail -n 1)"
-    echo "$BASE_URL/$latest/"
-  }
-
   MONTH_URL="$(get_latest_month_url)"
   log "Usando pasta do mês: $MONTH_URL"
+  YYYYMM="$(yyyymm_from_month_url "$MONTH_URL")"
 
+  # Padrões que cobrem nomes NOVOS e LEGADOS
   REQ_GROUPS=(
-    "ESTABELE:K.*ESTABELE.*\\.zip"
-    "EMPRECSV:K.*EMPRECSV.*\\.zip"
-    "SOCIOCSV:K.*SOCIOCSV.*\\.zip"
-    "MUNICCSV:.*MUNICCSV.*\\.zip"
-    "CNAECSV:.*CNAECSV.*\\.zip"
-    "QUALSCSV:.*QUALSCSV.*\\.zip"
-    "PAISCSV:.*PAISCSV.*\\.zip"     # opcional mas tentamos baixar
+    "ESTABELE:(Estabelecimentos[0-9]+\\.zip|K.*ESTABELE.*\\.zip)"
+    "EMPRECSV:(Empresas[0-9]+\\.zip|K.*EMPRECSV.*\\.zip)"
+    "SOCIOCSV:(Socios[0-9]+\\.zip|K.*SOCIOCSV.*\\.zip)"
+    "MUNICCSV:(Municipios\\.zip|.*MUNICCSV.*\\.zip)"
+    "CNAECSV:(Cnaes\\.zip|.*CNAECSV.*\\.zip)"
+    "QUALSCSV:(Qualificacoes\\.zip|.*QUALSCSV.*\\.zip)"
+    "PAISCSV:(Paises\\.zip|.*PAISCSV.*\\.zip)"
   )
+
+  list_links() {
+    curl -fsSL "$MONTH_URL" | grep -Eio 'href="[^"]+"' | sed -E 's/^href="|"$//g'
+  }
 
   download_group() {
     local key="$1" regex="$2"
-    if has_extracted "$key"; then
-      log "$key já extraído — OK"
+    if has_group "$key"; then
+      log "$key: já presente — pulando download."
       return 0
     fi
-    log "Baixando $key do mês atual…"
+    log "Baixando $key…"
     local links
-    links="$(curl -fsSL "$MONTH_URL" | grep -Eoi 'href="([^"]+)"' | sed -E 's/^href="|"$//g' | grep -E "$regex" || true)"
+    links="$(list_links | grep -E -i "$regex" || true)"
     if [[ -z "$links" ]]; then
       if [[ "$key" == "PAISCSV" ]]; then
-        warn "PAISCSV não encontrado no mês; seguiremos sem ele."
+        warn "PAISCSV não encontrado — seguindo sem ele."
         return 0
       fi
-      err "Nenhum arquivo encontrado para padrão $regex em $MONTH_URL"
+      err "$key: nenhum arquivo encontrado em $MONTH_URL (regex: $regex)"
       exit 1
     fi
     while IFS= read -r href; do
-      url="$MONTH_URL$href"
-      log "wget -c '$url'"
-      wget -c -q "$url"
+      [[ -z "$href" ]] && continue
+      local url="$MONTH_URL$href"
+      log "  wget -c $url"
+      wget -q -c "$url"
     done <<< "$links"
-    shopt -s nullglob
-    for z in *.zip; do
-      log "Extraindo $z…"
-      unzip -n -q "$z"
-    done
   }
 
+  # baixa o que faltar
   for grp in "${REQ_GROUPS[@]}"; do
     KEY="${grp%%:*}"
     RGX="${grp#*:}"
     download_group "$KEY" "$RGX"
   done
+
+  # ---- extração + normalização de nomes para casar com seus .py ----
+  normalize_move_file() {
+    local src="$1" ; local yyyymm="$2"
+    local b lc idx
+    b="$(basename "$src")"
+    lc="${b,,}"
+
+    # extrai índice (Empresas7.csv -> 7)
+    if [[ "$lc" =~ ([0-9]+)\.csv$ ]]; then idx="${BASH_REMATCH[1]}"; else idx=""; fi
+
+    if [[ "$lc" == empresas*.csv ]]; then
+      # cria nome que casa com K*.EMPRECSV*
+      local dest="K${yyyymm}.EMPRECSV${idx}.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == estabelecimentos*.csv ]]; then
+      local dest="K${yyyymm}.ESTABELE${idx}.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == socios*.csv ]]; then
+      local dest="K${yyyymm}.SOCIOCSV${idx}.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == municipios.csv ]]; then
+      local dest="F.K03200\$Z.D${yyyymm}.MUNICCSV.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == qualificacoes.csv ]]; then
+      local dest="F.K03200\$Z.D${yyyymm}.QUALSCSV.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == paises.csv ]]; then
+      local dest="F.K03200\$Z.D${yyyymm}.PAISCSV.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+    if [[ "$lc" == cnaes.csv ]]; then
+      local dest="F.K03200\$Z.D${yyyymm}.CNAECSV.csv"
+      [[ -s "$dest" ]] || mv -f "$src" "$dest"
+      echo "$dest"
+      return
+    fi
+  }
+
+  extract_and_normalize_one() {
+    local zip="$1" ; local yyyymm="$2"
+    local tmp; tmp="$(mktemp -d)"
+    unzip -q -o "$zip" -d "$tmp"
+    shopt -s nullglob
+    local moved=0
+    for csv in "$tmp"/*.csv; do
+      dest="$(normalize_move_file "$csv" "$yyyymm" || true)"
+      [[ -n "${dest:-}" ]] && moved=1
+    done
+    if [[ "$moved" -eq 0 ]]; then
+      warn "Nenhum CSV reconhecido dentro de $(basename "$zip")."
+    fi
+    rm -rf "$tmp"
+  }
+
+  extract_all() {
+    local yyyymm="$1"
+    shopt -s nullglob
+    for z in *.zip; do
+      extract_and_normalize_one "$z" "$yyyymm"
+    done
+  }
+
+  extract_all "$YYYYMM"
 fi
 
 #####################################
 # 2) Executar pipeline de .py (com retomada)
 #####################################
 
-# Passo 1: filtro por cidade(s) ativas + inclui CNAEs no CSV (colunas: nome,cnpj,endereco,cnae_*,municipio,uf)
+# Passo 1
 if [[ -s "$OUT_STEP1" ]]; then
   log "P1 já existe ($OUT_STEP1) — pulando."
 else
@@ -219,7 +291,7 @@ else
   $PY filtro_cidades_ativas.py "${CITY_ARGS[@]}" --uf "$UF" --out "$OUT_STEP1" --chunksize "$CHUNKSIZE"
 fi
 
-# Passo 2: filtra pelos CNAEs desejados
+# Passo 2
 if [[ -s "$OUT_STEP2" ]]; then
   log "P2 já existe ($OUT_STEP2) — pulando."
 else
@@ -229,7 +301,7 @@ else
   $PY filtra_por_cnae.py --in "$OUT_STEP1" --cnae "${CNAE_ARGS[@]}" --out "$OUT_STEP2"
 fi
 
-# Passo 3: merge com EMPRECSV + QUALSCSV (razão social, porte decod., qualificação)
+# Passo 3
 if [[ -s "$OUT_STEP3" ]]; then
   log "P3 já existe ($OUT_STEP3) — pulando."
 else
@@ -237,7 +309,7 @@ else
   $PY merge_com_empresas.py --in "$OUT_STEP2" --out "$OUT_STEP3" --chunksize "$CHUNKSIZE"
 fi
 
-# Passo 4: merge com SOCIOCSV (+ QUALSCSV e PAISCSV) — gera *_com_socios.csv
+# Passo 4
 if [[ -s "$OUT_STEP4" ]]; then
   log "P4 já existe ($OUT_STEP4) — pulando."
 else
@@ -245,14 +317,13 @@ else
   $PY merge_socios.py --in "$OUT_STEP3" --out "$OUT_STEP4" --chunksize "$CHUNKSIZE"
 fi
 
-# Passo 5: geocodifica e gera JSON (usando mapa.py = gerador de JSON)
+# Passo 5 (gera JSON)
 if [[ -s "$JSON_OUT" ]]; then
   log "P5 já existe ($JSON_OUT) — pulando geocodificação."
 else
   log "P5: mapa.py (gera JSON) → $JSON_OUT"
-
   KEEP_FLAG=(); [[ "$KEEP_MISSING_JSON" -eq 1 ]] && KEEP_FLAG+=(--keep-missing)
-  MAX_FLAG=(); [[ -n "${MAX_GEOCODE:-}" ]] && MAX_FLAG+=(--max-geocode "$MAX_GEOCODE")
+  MAX_FLAG=();  [[ -n "${MAX_GEOCODE:-}" ]] && MAX_FLAG+=(--max-geocode "$MAX_GEOCODE")
 
   $PY mapa.py \
     --base "$OUT_STEP2" \
@@ -264,7 +335,6 @@ else
     --user-agent "$USER_AGENT" \
     "${KEEP_FLAG[@]}" \
     "${MAX_FLAG[@]}"
-
 fi
 
 #####################################
@@ -294,6 +364,7 @@ if command -v xdg-open >/dev/null 2>&1; then
   xdg-open "$URL" >/dev/null 2>&1 || true
 else
   warn "xdg-open não disponível. Abra manualmente: $URL"
+  echo "$URL"
 fi
 
 log "Pipeline concluído com sucesso."
