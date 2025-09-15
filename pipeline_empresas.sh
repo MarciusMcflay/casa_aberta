@@ -49,14 +49,14 @@ err() { printf "\e[1;31m[ERRO]\e[0m %s\n" "$*" >&2; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Comando '$1' não encontrado."; return 1; }; }
 
-# acha AAAA-MM -> AAAAMM
+# AAAA-MM -> AAAAMM
 yyyymm_from_month_url() {
   local murl="$1"
   local seg="${murl%/}"; seg="${seg##*/}"     # 2025-09
   echo "${seg/-/}"                            # 202509
 }
 
-# checa se já tem arquivos extraídos/normalizados para um grupo
+# já tem arquivos extraídos/normalizados para um grupo?
 has_group() {
   local key="$1"
   shopt -s nullglob
@@ -128,7 +128,7 @@ fi
 #####################################
 BASE_URL="https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj"
 
-# Função que imprime **apenas** a URL do mês mais recente (AAAA-MM/)
+# imprime só a URL do mês mais recente (AAAA-MM/)
 get_latest_month_url() {
   curl -fsSL "$BASE_URL/" \
     | grep -Eo 'href="20[0-9]{2}-[01][0-9]/"' \
@@ -148,7 +148,7 @@ else
   log "Usando pasta do mês: $MONTH_URL"
   YYYYMM="$(yyyymm_from_month_url "$MONTH_URL")"
 
-  # Padrões que cobrem nomes NOVOS e LEGADOS
+  # Padrões (novos e legados)
   REQ_GROUPS=(
     "ESTABELE:(Estabelecimentos[0-9]+\\.zip|K.*ESTABELE.*\\.zip)"
     "EMPRECSV:(Empresas[0-9]+\\.zip|K.*EMPRECSV.*\\.zip)"
@@ -159,9 +159,7 @@ else
     "PAISCSV:(Paises\\.zip|.*PAISCSV.*\\.zip)"
   )
 
-  list_links() {
-    curl -fsSL "$MONTH_URL" | grep -Eio 'href="[^"]+"' | sed -E 's/^href="|"$//g'
-  }
+  list_links() { curl -fsSL "$MONTH_URL" | grep -Eio 'href="[^"]+"' | sed -E 's/^href="|"$//g'; }
 
   download_group() {
     local key="$1" regex="$2"
@@ -195,76 +193,93 @@ else
     download_group "$KEY" "$RGX"
   done
 
-  # ---- extração + normalização de nomes para casar com seus .py ----
-  normalize_move_file() {
-    local src="$1" ; local yyyymm="$2"
-    local b lc idx
-    b="$(basename "$src")"
-    lc="${b,,}"
+  # ---------- extração + normalização ----------
+  # mapeia categoria pelo nome do ZIP
+  category_from_zip() {
+    local zbl="${1,,}"
+    if [[ "$zbl" == *"estabelecimentos"* ]]; then echo "ESTABELE"; return; fi
+    if [[ "$zbl" == *"empresas"* ]];          then echo "EMPRECSV"; return; fi
+    if [[ "$zbl" == *"socios"* ]];            then echo "SOCIOCSV"; return; fi
+    if [[ "$zbl" == *"municipios"* ]];        then echo "MUNICCSV"; return; fi
+    if [[ "$zbl" == *"cnaes"* ]];             then echo "CNAECSV";  return; fi
+    if [[ "$zbl" == *"qualificacoes"* ]];     then echo "QUALSCSV"; return; fi
+    if [[ "$zbl" == *"paises"* ]];            then echo "PAISCSV";  return; fi
+    echo ""
+  }
 
-    # extrai índice (Empresas7.csv -> 7)
-    if [[ "$lc" =~ ([0-9]+)\.csv$ ]]; then idx="${BASH_REMATCH[1]}"; else idx=""; fi
+  # gera nome canônico de destino (sempre termina com .csv)
+  canon_dest_name() {
+    local category="$1" idx="$2" yyyymm="$3"
+    case "$category" in
+      EMPRECSV) echo "K${yyyymm}.EMPRECSV${idx}.csv" ;;
+      ESTABELE) echo "K${yyyymm}.ESTABELE${idx}.csv" ;;
+      SOCIOCSV) echo "K${yyyymm}.SOCIOCSV${idx}.csv" ;;
+      MUNICCSV) echo "F.K03200\$Z.D${yyyymm}.MUNICCSV.csv" ;;
+      CNAECSV)  echo "F.K03200\$Z.D${yyyymm}.CNAECSV.csv" ;;
+      QUALSCSV) echo "F.K03200\$Z.D${yyyymm}.QUALSCSV.csv" ;;
+      PAISCSV)  echo "F.K03200\$Z.D${yyyymm}.PAISCSV.csv" ;;
+      *)        echo "" ;;
+    esac
+  }
 
-    if [[ "$lc" == empresas*.csv ]]; then
-      # cria nome que casa com K*.EMPRECSV*
-      local dest="K${yyyymm}.EMPRECSV${idx}.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == estabelecimentos*.csv ]]; then
-      local dest="K${yyyymm}.ESTABELE${idx}.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == socios*.csv ]]; then
-      local dest="K${yyyymm}.SOCIOCSV${idx}.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == municipios.csv ]]; then
-      local dest="F.K03200\$Z.D${yyyymm}.MUNICCSV.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == qualificacoes.csv ]]; then
-      local dest="F.K03200\$Z.D${yyyymm}.QUALSCSV.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == paises.csv ]]; then
-      local dest="F.K03200\$Z.D${yyyymm}.PAISCSV.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
-    if [[ "$lc" == cnaes.csv ]]; then
-      local dest="F.K03200\$Z.D${yyyymm}.CNAECSV.csv"
-      [[ -s "$dest" ]] || mv -f "$src" "$dest"
-      echo "$dest"
-      return
-    fi
+  # tenta extrair índice a partir do nome do ZIP (Ex.: Empresas7.zip -> 7)
+  idx_from_zip() {
+    local base="${1##*/}"; base="${base%.*}"
+    if [[ "$base" =~ ([0-9]+)$ ]]; then echo "${BASH_REMATCH[1]}"; else echo ""; fi
   }
 
   extract_and_normalize_one() {
     local zip="$1" ; local yyyymm="$2"
+    local cat="$(category_from_zip "$zip")"
+    [[ -z "$cat" ]] && { warn "Categoria desconhecida para $(basename "$zip") — pulando."; return; }
+    local idx="$(idx_from_zip "$zip")"
+
     local tmp; tmp="$(mktemp -d)"
-    unzip -q -o "$zip" -d "$tmp"
+    # protege contra falha de unzip mesmo com 'set -e'
+    if ! unzip -q -o "$zip" -d "$tmp"; then
+      warn "Falha ao extrair $(basename "$zip"); mantendo o ZIP para diagnóstico."
+      rm -rf "$tmp"
+      return
+    fi
+
     shopt -s nullglob
     local moved=0
-    for csv in "$tmp"/*.csv; do
-      dest="$(normalize_move_file "$csv" "$yyyymm" || true)"
-      [[ -n "${dest:-}" ]] && moved=1
+    # pega QUALQUER arquivo extraído (com ou sem extensão)
+    for f in "$tmp"/*; do
+      [[ -f "$f" ]] || continue
+      local dest
+      case "$cat" in
+        MUNICCSV|CNAECSV|QUALSCSV|PAISCSV)
+          dest="$(canon_dest_name "$cat" "" "$yyyymm")"
+          ;;
+        *)
+          dest="$(canon_dest_name "$cat" "$idx" "$yyyymm")"
+          ;;
+      esac
+      if [[ -n "$dest" ]]; then
+        [[ "$dest" != *.csv ]] && dest="${dest}.csv"
+        if [[ ! -s "$dest" ]]; then
+          mv -f "$f" "$dest"
+          moved=1
+        fi
+      fi
     done
-    if [[ "$moved" -eq 0 ]]; then
-      warn "Nenhum CSV reconhecido dentro de $(basename "$zip")."
-    fi
+
     rm -rf "$tmp"
+
+    # apaga o ZIP após extração (independente de ter movido algo,
+    # pois pode já existir com esse mês/índice)
+    if rm -f "$zip"; then
+      log "Apagado ZIP: $(basename "$zip")"
+    else
+      warn "Não foi possível apagar: $(basename "$zip")"
+    fi
+
+    if [[ "$moved" -eq 0 ]]; then
+      warn "Nenhum arquivo novo movido de $(basename "$zip") (provavelmente já existiam)."
+    fi
   }
+
 
   extract_all() {
     local yyyymm="$1"
@@ -275,6 +290,14 @@ else
   }
 
   extract_all "$YYYYMM"
+
+  # sanity check pós-extração
+  for g in ESTABELE EMPRECSV SOCIOCSV MUNICCSV CNAECSV QUALSCSV; do
+    if ! has_group "$g"; then
+      err "Após extração, grupo $g ainda não encontrado — verifique os zips baixados."
+      exit 1
+    fi
+  done
 fi
 
 #####################################
