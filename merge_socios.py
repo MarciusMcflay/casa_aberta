@@ -13,25 +13,10 @@
 #   --only PF|PJ|EXT|ALL        (filtra tipo de sócio: PF=2, PJ=1, EXT=3; default ALL)
 #   --max-n 50000               (limita linhas processadas p/ teste)
 #
-# Padrão (tudo): PF, PJ e estrangeiros; decodifica qualificação e país
-# python merge_socios.py \
-#   --in empresas_tecnologia_sc_ativas_enriquecidas.csv \
-#   --out empresas_tecnologia_sc_ativas_com_socios.csv \
-#   --chunksize 300000
-
-# Somente Pessoa Física
-# python merge_socios.py \
-#   --in empresas_tecnologia_sc_ativas_enriquecidas.csv \
-#   --out empresas_tecnologia_sc_ativas_com_socios_pf.csv \
-#   --only PF --chunksize 300000
-
-# Indicando globs diferentes e limitando processamento (teste)
-# python merge_socios.py \
-#   --in base.csv --out saida_socios.csv \
-#   --soc-glob "K*.SOCIOCSV*" \
-#   --qual-glob "*QUALSCSV*" \
-#   --pais-glob "*PAISCSV*" \
-#   --chunksize 200000 --max-n 100000
+# Observações:
+# - Este script **preserva** colunas de contato vindas dos passos anteriores
+#   (email, telefone_*), bem como colunas úteis (endereco, CNAEs, municipio, uf).
+# - Não altera geocache; atua somente nos CSVs do pipeline.
 
 from pathlib import Path
 import argparse
@@ -116,7 +101,20 @@ def main():
     base = base[base["cnpj"].str.len() == 14].copy()
     base["cnpj_basico"] = base["cnpj"].str[:8]
 
-    EMP_FIELDS = [c for c in ["razao_social","porte_empresa_txt","capital_social","nome","endereco"] if c in base.columns]
+    # Campos que queremos carregar da base e PRESERVAR no resultado
+    CONTACT_FIELDS = [
+        "email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+        "telefone_1_full","telefone_2_full","telefones_norm"
+    ]
+    OTHER_FIELDS = [
+        "razao_social","porte_empresa_txt","capital_social",
+        "nome","nome_fantasia","endereco",
+        "cnae_fiscal_principal","cnaes_secundarios",
+        "municipio","uf"
+    ]
+    EMP_FIELDS = [c for c in OTHER_FIELDS + CONTACT_FIELDS if c in base.columns]
+
+    # Base mínima para merge m:1 (uma linha por cnpj_basico)
     base_min = base[["cnpj_basico","cnpj"] + EMP_FIELDS].drop_duplicates("cnpj_basico")
     alvo_basicos = set(base_min["cnpj_basico"].unique().tolist())
     print(f"Empresas na base: {len(base):,} | cnpj_basico únicos: {len(alvo_basicos):,}")
@@ -194,12 +192,18 @@ def main():
                 if merged.empty:
                     continue
 
-                # colunas de saída (só adiciona as que existirem)
+                # colunas de saída (empresa + contatos + socio + representante)
                 out_cols = [
                     # empresa
-                    *(["razao_social"] if "razao_social" in merged.columns else []),
+                    "razao_social" if "razao_social" in merged.columns else None,
                     "cnpj",
-                    *[c for c in ["nome","endereco","porte_empresa_txt","capital_social"] if c in merged.columns],
+                    *[c for c in ["nome","nome_fantasia","endereco",
+                                  "cnae_fiscal_principal","cnaes_secundarios",
+                                  "municipio","uf",
+                                  "porte_empresa_txt","capital_social"] if c in merged.columns],
+                    # contatos (se existirem)
+                    *[c for c in ["email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+                                  "telefone_1_full","telefone_2_full","telefones_norm"] if c in merged.columns],
                     # socio
                     "identificador_socio","identificador_socio_txt",
                     "nome_socio_razao_social","doc_socio",
@@ -210,6 +214,7 @@ def main():
                     "cod_qualificacao_representante","qualificacao_representante_txt",
                     "faixa_etaria",
                 ]
+                out_cols = [c for c in out_cols if c is not None and c in merged.columns]
 
                 merged[out_cols].to_csv(
                     out_path, index=False, mode="a",

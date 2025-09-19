@@ -34,6 +34,7 @@ VENV_DIR=".venv"
 
 KEEP_MISSING_JSON=0
 MAX_GEOCODE=""
+RESET_GEOCACHE=0   # 1 = apaga o geocache antes de geocodificar (opcional)
 
 #####################################
 # Utilitários
@@ -54,6 +55,17 @@ parse_yyyymm_from_name() {
     mm="${BASH_REMATCH[1]}"
   fi
   printf '%s' "$mm"
+}
+
+# Verifica se um CSV possui TODAS as colunas informadas no header
+have_cols() {
+  local csv="$1"; shift
+  [[ -s "$csv" ]] || return 1
+  local hdr; hdr="$(head -n1 "$csv" | tr -d '\r')"
+  for col in "$@"; do
+    echo "$hdr" | grep -q -i -w "$col" || return 1
+  done
+  return 0
 }
 
 #####################################
@@ -130,11 +142,10 @@ yyyymm_from_month_url() {
   fi
   local murl="$1"
   local seg
-  seg="${murl%/}"          # remove barra final
-  seg="${seg##*/}"         # pega o último segmento (ex.: 2025-09)
-  printf '%s\n' "${seg/-/}"  # remove o hífen -> 202509
+  seg="${murl%/}"
+  seg="${seg##*/}"
+  printf '%s\n' "${seg/-/}"
 }
-
 
 list_links() {
   local month_url="$1"
@@ -197,7 +208,6 @@ expected_indices_from_html() {
       echo ""
     fi
   else
-    # se não houver match, imprime vazio e retorna 0
     echo "$html" | grep -Eio "$re" | sed -E 's/[^0-9]//g' | sort -n | uniq | xargs || true
   fi
   return 0
@@ -237,7 +247,7 @@ extract_one_zip_to_canonical() {
     elif [[ "$zbl" == *"qualscsv"*  ]]; then cat="QUALSCSV"
     elif [[ "$zbl" == *"cnaecsv"*   ]]; then cat="CNAECSV"
     elif [[ "$zbl" == *"municcsv"*  ]]; then cat="MUNICCSV"
-    elif [[ "$zbl" == *"paiscsv"*   ]]; then cat="PAISCSV" 
+    elif [[ "$zbl" == *"paiscsv"*   ]]; then cat="PAISCSV"
     fi
   else
     warn "Não consegui inferir a categoria do ZIP: $zip — pulando."
@@ -278,7 +288,7 @@ extract_one_zip_to_canonical() {
     log "Apagado ZIP: $(basename "$zip")"
   fi
 
-  # >>> CORREÇÃO CRÍTICA: não deixar [[ ... ]] “seco” no fim da função com -e
+  # Não deixar um [[ ... ]] “seco” com set -e
   if [[ "$moved" -eq 0 ]]; then
     warn "Nenhum arquivo novo movido de $(basename "$zip") (provável duplicata)."
   fi
@@ -413,7 +423,6 @@ for CAT in "${CATS[@]}"; do
       log "Baixando partes em falta para $CAT…"
       links="$(list_links "$REMOTE_MONTH_URL" || true)"
       re="$(zip_regex_for_cat "$CAT")"
-      # mapfile seguro: não derruba se não houver match
       mapfile -t cat_links < <(printf '%s\n' "${links:-}" | grep -E -i "$re" || true)
       if [[ ${#cat_links[@]} -eq 0 ]]; then
         err "Não encontrei ZIPs de $CAT em $REMOTE_MONTH_URL."
@@ -457,26 +466,31 @@ for CAT in "${CATS[@]}"; do
 done
 
 #####################################
-# 3) Executar pipeline de .py (com retomada)
+# 3) Executar pipeline de .py (com retomada + validação de contatos)
 #####################################
-if [[ -s "$OUT_STEP1" ]]; then
-  log "P1 já existe ($OUT_STEP1) — pulando."
+# Passo 1: se não existir OU não tiver colunas de contato, refaz
+if [[ -s "$OUT_STEP1" ]] && have_cols "$OUT_STEP1" "email" "telefone_1_full" "telefone_2_full" "telefones_norm"; then
+  log "P1 já existe ($OUT_STEP1) — colunas de contato OK — pulando."
 else
   log "P1: filtro_cidades_ativas.py → $OUT_STEP1"
+  rm -f "$OUT_STEP1"
   CITY_ARGS=()
   for c in "${CITIES[@]}"; do CITY_ARGS+=("-c" "$c"); done
   $PY filtro_cidades_ativas.py "${CITY_ARGS[@]}" --uf "$UF" --out "$OUT_STEP1" --chunksize "$CHUNKSIZE"
 fi
 
-if [[ -s "$OUT_STEP2" ]]; then
-  log "P2 já existe ($OUT_STEP2) — pulando."
+# Passo 2: idem — precisa carregar as colunas de contato adiante
+if [[ -s "$OUT_STEP2" ]] && have_cols "$OUT_STEP2" "email" "telefone_1_full" "telefone_2_full" "telefones_norm"; then
+  log "P2 já existe ($OUT_STEP2) — colunas de contato OK — pulando."
 else
   log "P2: filtra_por_cnae.py → $OUT_STEP2"
+  rm -f "$OUT_STEP2"
   CNAE_ARGS=()
   for k in "${CNAES[@]}"; do CNAE_ARGS+=("$k"); done
   $PY filtra_por_cnae.py --in "$OUT_STEP1" --cnae "${CNAE_ARGS[@]}" --out "$OUT_STEP2"
 fi
 
+# P3 e P4 agora preservam contatos, então só refaça se não existirem
 if [[ -s "$OUT_STEP3" ]]; then
   log "P3 já existe ($OUT_STEP3) — pulando."
 else
@@ -489,6 +503,12 @@ if [[ -s "$OUT_STEP4" ]]; then
 else
   log "P4: merge_socios.py → $OUT_STEP4"
   $PY merge_socios.py --in "$OUT_STEP3" --out "$OUT_STEP4" --chunksize "$CHUNKSIZE"
+fi
+
+# (Opcional) reset geocache
+if [[ "$RESET_GEOCACHE" -eq 1 ]]; then
+  log "Limpando geocache ($GEOCACHE)…"
+  rm -f "$GEOCACHE"
 fi
 
 if [[ -s "$JSON_OUT" ]]; then

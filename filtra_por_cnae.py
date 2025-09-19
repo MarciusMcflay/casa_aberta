@@ -2,8 +2,14 @@
 # Uso:
 #   python filtra_por_cnae.py --in empresas_ativas_sc.csv --cnae 6201501 6311900 6319400 --out empresas_sc_cnaes.csv
 #
-# Entrada: CSV do passo 1 com colunas: nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, municipio, uf
-# Saída:   nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, match_por, municipio, uf
+# Entrada: CSV do passo 1 com colunas mínimas:
+#   nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, municipio, uf
+# (Opcionalmente com contatos: email, ddd_1, telefone_1, ddd_2, telefone_2, fax,
+#  telefone_1_full, telefone_2_full, telefones_norm)
+#
+# Saída: mantém as colunas base + contatos (quando existirem):
+#   nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, match_por, municipio, uf,
+#   [email, ddd_1, telefone_1, ddd_2, telefone_2, fax, telefone_1_full, telefone_2_full, telefones_norm]
 
 import argparse
 import re
@@ -25,19 +31,23 @@ def extrai_7digs(txt: str):
         return set()
     return set(re.findall(r"\d{7}", s(txt)))
 
+def normaliza_lista_cnaes(arg_list):
+    """Aceita CNAEs separados por espaço e/ou vírgula e retorna set só com 7 dígitos."""
+    raw = []
+    for item in arg_list:
+        raw += re.split(r"[,\s]+", item.strip())
+    cnaes = {re.sub(r"\D", "", c) for c in raw if c.strip()}
+    return {c for c in cnaes if len(c) == 7}
+
 def main():
     ap = argparse.ArgumentParser(description="Filtra a saída do filtro_cidades_ativas por uma lista de CNAEs (7 dígitos).")
     ap.add_argument("--in", dest="input_csv", required=True, help="CSV do passo 1 (precisa ter cnae_fiscal_principal e cnaes_secundarios).")
-    ap.add_argument("--cnae", nargs="+", required=True, help="Lista de CNAEs (7 dígitos), separados por espaço (e/ou vírgula).")
+    ap.add_argument("--cnae", nargs="+", required=True, help="Lista de CNAEs (7 dígitos), separados por espaço e/ou vírgula.")
     ap.add_argument("--out", default="empresas_filtradas_por_cnae.csv", help="Arquivo de saída.")
     args = ap.parse_args()
 
-    # normaliza CNAEs: aceita espaço ou vírgula
-    raw = []
-    for item in args.cnae:
-        raw += re.split(r"[,\s]+", item.strip())
-    cnaes = {re.sub(r"\D", "", c) for c in raw if c.strip()}
-    cnaes = {c for c in cnaes if len(c) == 7}
+    # Normaliza CNAEs
+    cnaes = normaliza_lista_cnaes(args.cnae)
     if not cnaes:
         raise SystemExit("Nenhum CNAE válido (7 dígitos) informado.")
 
@@ -47,17 +57,18 @@ def main():
 
     df = pd.read_csv(path, dtype=str, keep_default_na=False, na_filter=False)
 
-    required = {"nome","cnpj","endereco","cnae_fiscal_principal","cnaes_secundarios","municipio","uf"}
-    missing = required - set(df.columns)
+    # Colunas mínimas exigidas
+    base_required = {"nome","cnpj","endereco","cnae_fiscal_principal","cnaes_secundarios","municipio","uf"}
+    missing = base_required - set(df.columns)
     if missing:
-        raise ValueError(f"O CSV de entrada precisa conter as colunas: {sorted(required)}. Ausentes: {sorted(missing)}")
+        raise ValueError(f"O CSV de entrada precisa conter as colunas: {sorted(base_required)}. Ausentes: {sorted(missing)}")
 
-    # avalia match principal/secundário
+    # Avalia match por principal e secundário
     df["m_principal"] = df["cnae_fiscal_principal"].isin(cnaes)
     df["m_sec"] = df["cnaes_secundarios"].map(lambda x: len(extrai_7digs(x) & cnaes) > 0)
     sel = df[df["m_principal"] | df["m_sec"]].copy()
 
-    # classificador
+    # Classificador do match
     def tag(row):
         if row["m_principal"] and row["m_sec"]:
             return "ambos"
@@ -66,11 +77,22 @@ def main():
     if sel.empty:
         sel = df.head(0).copy()
         sel["match_por"] = ""
-
     else:
         sel["match_por"] = sel.apply(tag, axis=1)
 
-    out_cols = ["nome","cnpj","endereco","cnae_fiscal_principal","cnaes_secundarios","match_por","municipio","uf"]
+    # Colunas base da saída
+    base_out = ["nome","cnpj","endereco","cnae_fiscal_principal","cnaes_secundarios","match_por","municipio","uf"]
+
+    # Colunas de contato a preservar, se existirem
+    possible_contact_cols = [
+        "email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+        "telefone_1_full","telefone_2_full","telefones_norm"
+    ]
+    contact_cols = [c for c in possible_contact_cols if c in sel.columns]
+
+    out_cols = base_out + contact_cols
+
+    # Ordena e grava
     sel[out_cols].sort_values(["nome","cnpj"]).to_csv(args.out, index=False, encoding="utf-8")
     print(f"Gerado: {args.out}  (linhas: {len(sel)})")
 

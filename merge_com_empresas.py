@@ -1,20 +1,19 @@
-# merge_empresas_qualificacao_porte.py
+# merge_com_empresas.py
 # Enriquecimento da base (por CNPJ) com dados de EMPRECSV + QUALSCSV
 # - junta razão social, porte (decodificado) e qualificação do responsável (decodificada)
 #
 # Uso (exemplos):
-#   python merge_empresas_qualificacao_porte.py --in empresas_tecnologia_sao_carlos_ativas.csv \
+#   python merge_com_empresas.py --in empresas_tecnologia_sao_carlos_ativas.csv \
 #       --out empresas_tecnologia_sc_ativas_enriquecidas.csv --chunksize 300000
 #
 #   # se os arquivos estiverem com nomes/globs diferentes:
-#   python merge_empresas_qualificacao_porte.py --in base.csv --out saida.csv \
+#   python merge_com_empresas.py --in base.csv --out saida.csv \
 #       --emp-glob "K*.EMPRECSV*" --qual-glob "*QUALSCSV*" --chunksize 200000
 #
-# python merge_empresas_qualificacao_porte.py \
-# --in empresas_tecnologia_sao_carlos_ativas.csv \
-# --out empresas_tecnologia_sc_ativas_enriquecidas.csv \
-# --chunksize 300000
-
+# Observação:
+# - Este script PRESERVA as colunas de contato vindas do passo 1/2 (email, telefone_*),
+#   além de outras colunas úteis (endereco, cnaes, municipio, uf, etc.).
+# - Não altera geocache; atua apenas nos CSVs do pipeline.
 
 from pathlib import Path
 import argparse
@@ -65,7 +64,7 @@ def main():
     if not input_path.exists():
         raise FileNotFoundError(f"Não encontrei o CSV de entrada: {input_path}")
 
-    # 0) Ler base de ativos (com cnpj 14 dígitos)
+    # 0) Ler base (com cnpj 14 dígitos)
     base = pd.read_csv(input_path, dtype=str, keep_default_na=False, na_filter=False)
     if "cnpj" not in base.columns:
         raise ValueError(f"'{input_path.name}' precisa ter a coluna 'cnpj' (14 dígitos).")
@@ -84,11 +83,15 @@ def main():
     if not qual_files:
         raise FileNotFoundError(f"Não encontrei '{args.qual_glob}' na pasta (ex.: F.K03200$Z.D50809.QUALSCSV).")
 
-    ncols_qual = pd.read_csv(qual_files[0], sep=";", encoding="latin1", header=None,
-                             nrows=1, keep_default_na=False, na_filter=False).shape[1]
+    ncols_qual = pd.read_csv(
+        qual_files[0], sep=";", encoding="latin1", header=None,
+        nrows=1, keep_default_na=False, na_filter=False
+    ).shape[1]
     usecols_qual = [0, 1] if ncols_qual >= 2 else [0]
-    quals = pd.read_csv(qual_files[0], sep=";", encoding="latin1", header=None,
-                        usecols=usecols_qual, dtype=str, keep_default_na=False, na_filter=False)
+    quals = pd.read_csv(
+        qual_files[0], sep=";", encoding="latin1", header=None,
+        usecols=usecols_qual, dtype=str, keep_default_na=False, na_filter=False
+    )
     if quals.shape[1] < 2:
         raise ValueError("QUALSCSV não tem ao menos duas colunas (código;descrição).")
     quals.columns = ["cod_qualificacao", "qualificacao_responsavel_txt"]
@@ -125,8 +128,27 @@ def main():
         out["capital_social"] = ""
         out["qualificacao_responsavel"] = ""
         out["qualificacao_responsavel_txt"] = ""
-        out.to_csv(output_path, index=False, encoding="utf-8")
-        print(f"Gerado: {output_path} | linhas: {len(out)}")
+        # Ordenação e saída preservando colunas úteis/contatos
+        possible_contact_cols = [
+            "email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+            "telefone_1_full","telefone_2_full","telefones_norm"
+        ]
+        passthrough_cols = [
+            "nome","nome_fantasia","endereco",
+            "cnae_fiscal_principal","cnaes_secundarios",
+            "municipio","uf"
+        ]
+        cols_prefer = [
+            "razao_social","cnpj",
+            *[c for c in passthrough_cols if c in out.columns],
+            "porte_empresa","porte_empresa_txt","capital_social",
+            "qualificacao_responsavel","qualificacao_responsavel_txt",
+            *[c for c in possible_contact_cols if c in out.columns],
+        ]
+        cols_prefer = [c for c in cols_prefer if c in out.columns]
+        saida = out[cols_prefer].drop_duplicates(subset=["cnpj"]).sort_values(["razao_social","cnpj"])
+        saida.to_csv(output_path, index=False, encoding="utf-8")
+        print(f"Gerado: {output_path} | linhas: {len(saida)}")
         return
 
     emp = pd.concat(hits, ignore_index=True).drop_duplicates(subset=["cnpj_basico"])
@@ -139,21 +161,39 @@ def main():
     # 3) Merge final (m:1 via cnpj_basico)
     out = base.merge(emp, on="cnpj_basico", how="left", validate="m:1")
 
-    # 4) Ordena e salva
-    cols_prefer = [
-        "razao_social", "cnpj",
-        # se existirem da sua base:
-        *[c for c in ["nome", "nome_fantasia", "endereco"] if c in out.columns],
-        # enriquecidos
-        "porte_empresa", "porte_empresa_txt",
-        "capital_social",
-        "qualificacao_responsavel", "qualificacao_responsavel_txt",
+    # 4) Ordena e salva (preservando contatos e colunas úteis)
+    possible_contact_cols = [
+        "email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+        "telefone_1_full","telefone_2_full","telefones_norm"
     ]
+    passthrough_cols = [
+        "nome","nome_fantasia","endereco",
+        "cnae_fiscal_principal","cnaes_secundarios",
+        "municipio","uf"
+    ]
+
+    cols_prefer = [
+        "razao_social","cnpj",
+        *[c for c in passthrough_cols if c in out.columns],
+        "porte_empresa","porte_empresa_txt",
+        "capital_social",
+        "qualificacao_responsavel","qualificacao_responsavel_txt",
+        *[c for c in possible_contact_cols if c in out.columns],
+    ]
+
+    # garante colunas mesmo que vazias
     for c in cols_prefer:
         if c not in out.columns:
             out[c] = ""
 
-    saida = out[cols_prefer].drop_duplicates(subset=["cnpj"]).sort_values(["razao_social","cnpj"])
+    # Seleção & ordenação
+    cols_prefer = [c for c in cols_prefer if c in out.columns]
+    saida = (
+        out[cols_prefer]
+        .drop_duplicates(subset=["cnpj"])
+        .sort_values(["razao_social","cnpj"], na_position="last")
+    )
+
     saida.to_csv(output_path, index=False, encoding="utf-8")
 
     print(f"\nGerado: {output_path} | linhas: {len(saida)}")

@@ -111,14 +111,33 @@
       const socios = Array.isArray(item.socios) ? item.socios : [];
       const nSoc = Number(item.n_socios || socios.length || 0);
 
+      const emails = Array.isArray(item.emails) ? item.emails : [];
+      const phones = Array.isArray(item.phones) ? item.phones : [];
+
       const link = (lat != null && lon != null) ? (
         `<a href="${GOOGLE_LINK(lat, lon)}" target="_blank">Abrir no Google Maps</a>`
       ) : "";
 
+      const emailsBlock = emails.length ? `<div><b>E-mail(s):</b> ${emails.map(e => `<div><a href="mailto:${esc(e)}">${esc(e)}</a></div>`).join("")}</div>` : "";
+      const phonesBlock = phones.length ? `<div><b>Telefone(s):</b> ${phones.map(p => `<div><a href="tel:${esc(p)}">${esc(p)}</a></div>`).join("")}</div>` : "";
+
+      // socios: se for string -> li simples; se for objeto -> nome + contatos
       const sociosBlock = nSoc
         ? `<div class="socios"><b>Sócios (${nSoc}):</b><ul>${
-            socios.slice(0, 10).map(s => `<li>${esc(s)}</li>`).join("")
-          }${nSoc > 10 ? `<li>… (+${nSoc-10} mais)</li>` : ""}</ul></div>`
+            socios.slice(0, 20).map(s => {
+              if (typeof s === "string") return `<li>${esc(s)}</li>`;
+              // objeto esperado: {name, emails?, phones?}
+              const name = esc(s.name || s.nome || "—");
+              const parts = [];
+              if (Array.isArray(s.emails) && s.emails.length) {
+                parts.push(s.emails.map(e => `<a href="mailto:${esc(e)}">${esc(e)}</a>`).join(" • "));
+              }
+              if (Array.isArray(s.phones) && s.phones.length) {
+                parts.push(s.phones.map(p => `<a href="tel:${esc(p)}">${esc(p)}</a>`).join(" • "));
+              }
+              return `<li>${name}${parts.length ? `<div style="font-size:12px;margin-top:.25rem">${parts.join(" / ")}</div>` : ""}</li>`;
+            }).join("")
+          }${nSoc > 20 ? `<li>… (+${nSoc-20} mais)</li>` : ""}</ul></div>`
         : "";
 
       return `
@@ -128,11 +147,14 @@
           ${porte ? `<div>Porte: ${porte}</div>` : ""}
           ${cap ? `<div>Capital social: ${cap}</div>` : ""}
           ${end ? `<div>Endereço: ${end}</div>` : ""}
+          ${emailsBlock}
+          ${phonesBlock}
           ${link ? `<div style="margin-top:.25rem">${link}</div>` : ""}
           ${sociosBlock}
         </div>
       `;
     }
+
 
     function makeMap() {
       const map = L.map("map", {

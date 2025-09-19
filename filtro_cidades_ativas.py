@@ -3,8 +3,9 @@
 #   python filtro_cidades_ativas.py -c "São Carlos" --uf "SP" --out empresas_ativas_sc.csv --chunksize 300000
 #   python filtro_cidades_ativas.py -c "São Carlos" -c "Araraquara" --uf "SP" --out empresas_ativas_cidades.csv --chunksize 300000
 #
-# Saída: empresas_ativas_filtradas.csv  com colunas:
-#   nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, municipio, uf
+# Saída (CSV) com colunas:
+#   nome, cnpj, endereco, cnae_fiscal_principal, cnaes_secundarios, municipio, uf,
+#   email, ddd_1, telefone_1, ddd_2, telefone_2, fax, telefone_1_full, telefone_2_full, telefones_norm
 
 import argparse
 import unicodedata
@@ -15,10 +16,10 @@ import pandas as pd
 # ---------- util ----------
 def norm_txt(x: str) -> str:
     """Normaliza para busca: remove acentos, colapsa espaços, UPPER."""
-    s = (x or "").strip()
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"\s+", " ", s).upper().strip()
-    return s
+    s_ = (x or "").strip()
+    s_ = unicodedata.normalize("NFKD", s_).encode("ascii", "ignore").decode("ascii")
+    s_ = re.sub(r"\s+", " ", s_).upper().strip()
+    return s_
 
 def s(x) -> str:
     if x is None:
@@ -111,6 +112,17 @@ def load_municipios():
     mun["uf_norm"]   = mun["uf"].map(norm_txt)
     return mun
 
+def join_tel(ddd, tel) -> str:
+    """Normaliza DDD/telefone para formato +55DDDNÚMERO (apenas dígitos)."""
+    d = re.sub(r"\D", "", s(ddd))
+    t = re.sub(r"\D", "", s(tel))
+    if not t:
+        return ""
+    if d and not t.startswith(d):
+        return f"+55{d}{t}"
+    # quando o número já incluir DDD dentro de 'telefone'
+    return f"+55{t}" if not t.startswith("55") else f"+{t}"
+
 # ---------- leitura resiliente por chunks ----------
 def iter_chunks_csv(path, engine_mode: str, **kwargs):
     """
@@ -137,7 +149,7 @@ def iter_chunks_csv(path, engine_mode: str, **kwargs):
             yield from _yield("python")
 
 def main():
-    ap = argparse.ArgumentParser(description="Filtra ESTABELE por cidade(s) e status ATIVA, já incluindo CNAEs.")
+    ap = argparse.ArgumentParser(description="Filtra ESTABELE por cidade(s) e status ATIVA, já incluindo CNAEs e contatos.")
     ap.add_argument("-c", "--city", action="append", required=True,
                     help="Nome da cidade (repita a opção para múltiplas). Ex.: -c 'São Carlos' -c 'Araraquara'")
     ap.add_argument("--uf", required=True, help="UF a filtrar (ex.: SP)")
@@ -180,13 +192,20 @@ def main():
         raise FileNotFoundError("Nenhum K*.ESTABELE* encontrado.")
 
     COLS_EST = detect_cols_est(est_files[0])
-    USECOLS = [
+
+    # Colunas base que SEMPRE queremos ler
+    base_usecols = [
         "cnpj_basico","cnpj_ordem","cnpj_dv","nome_fantasia",
         "situacao_cadastral",
         "cnae_fiscal_principal","cnaes_secundarios",
         "tipo_logradouro","logradouro","numero","complemento","bairro","cep",
         "uf","codigo_municipio","municipio"
     ]
+    # Colunas de contato, conforme existirem no layout
+    possible_contact_cols = ["ddd_1","telefone_1","ddd_2","telefone_2","ddd_fax","fax","email"]
+    contact_usecols = [c for c in possible_contact_cols if c in COLS_EST]
+
+    USECOLS = base_usecols + contact_usecols
 
     out_path = Path(args.out)
     out_path.unlink(missing_ok=True)
@@ -228,22 +247,56 @@ def main():
 
                     # normaliza campos para compor endereço
                     for c in ["tipo_logradouro","logradouro","numero","complemento","bairro","cep","municipio","uf",
-                              "cnae_fiscal_principal","cnaes_secundarios"]:
-                        sel[c] = sel[c].map(s)
+                              "cnae_fiscal_principal","cnaes_secundarios","nome_fantasia"]:
+                        if c in sel.columns:
+                            sel[c] = sel[c].map(s)
 
                     # injeta a cidade/UF exatamente como digitadas
                     sel["municipio_out"] = sel["codigo_municipio"].map(lambda k: code_to_city_display.get(k, ""))
                     sel["uf_out"] = uf_user
 
+                    # CNPJ completo
                     sel["cnpj"] = sel.apply(lambda r: cnpj_full(r["cnpj_basico"], r["cnpj_ordem"], r["cnpj_dv"]), axis=1)
-                    sel["endereco"] = sel.apply(monta_endereco, axis=1)
-                    sel["nome"] = sel["nome_fantasia"].map(s)
 
-                    out = sel[[
+                    # Endereço formatado
+                    sel["endereco"] = sel.apply(monta_endereco, axis=1)
+
+                    # Nome fantasia (string segura)
+                    sel["nome"] = sel["nome_fantasia"].map(s) if "nome_fantasia" in sel.columns else ""
+
+                    # ---------------- Contatos ----------------
+                    # e-mail
+                    if "email" in sel.columns:
+                        sel["email"] = sel["email"].map(lambda x: s(x).strip())
+
+                    # telefones normalizados
+                    if "ddd_1" not in sel.columns: sel["ddd_1"] = ""
+                    if "telefone_1" not in sel.columns: sel["telefone_1"] = ""
+                    if "ddd_2" not in sel.columns: sel["ddd_2"] = ""
+                    if "telefone_2" not in sel.columns: sel["telefone_2"] = ""
+                    if "fax" not in sel.columns: sel["fax"] = ""
+
+                    sel["telefone_1_full"] = sel.apply(lambda r: join_tel(r.get("ddd_1"), r.get("telefone_1")), axis=1)
+                    sel["telefone_2_full"] = sel.apply(lambda r: join_tel(r.get("ddd_2"), r.get("telefone_2")), axis=1)
+                    sel["telefones_norm"]  = sel.apply(
+                        lambda r: ";".join([x for x in [s(r.get("telefone_1_full")).strip(),
+                                                        s(r.get("telefone_2_full")).strip()] if x]),
+                        axis=1
+                    )
+
+                    # Seleção de saída
+                    base_cols = [
                         "nome","cnpj","endereco",
                         "cnae_fiscal_principal","cnaes_secundarios",
                         "municipio_out","uf_out"
-                    ]].rename(columns={"municipio_out":"municipio","uf_out":"uf"})
+                    ]
+                    # manter contatos somente se existirem no chunk
+                    contact_cols_out = [c for c in ["email","ddd_1","telefone_1","ddd_2","telefone_2","fax",
+                                                    "telefone_1_full","telefone_2_full","telefones_norm"]
+                                        if c in sel.columns]
+                    out_cols = base_cols + contact_cols_out
+
+                    out = sel[out_cols].rename(columns={"municipio_out":"municipio","uf_out":"uf"})
 
                     # dedupe inter-arquivos
                     out = out[~out["cnpj"].isin(seen_cnpjs)]

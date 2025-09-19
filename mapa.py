@@ -65,24 +65,73 @@ def load_enriched_optional(path: Path) -> Optional[pd.DataFrame]:
     df = df[df["cnpj"].str.len() == 14].copy()
     return df
 
+def split_multi(cell: str) -> List[str]:
+    """Divide strings com múltiplos valores (separados por ; , /) e limpa."""
+    vals = []
+    for part in re.split(r"[;,/]\s*", s(cell)):
+        p = part.strip()
+        if p:
+            vals.append(p)
+    return list(dict.fromkeys(vals))  # dedup preservando ordem
+
+# -------- coleta contatos do ROW (fallback/local) --------
+def collect_contacts_from_row(row: pd.Series) -> Dict[str, List[str]]:
+    emails: List[str] = []
+    phones: List[str] = []
+
+    # E-mails diretos
+    for c in row.index:
+        cl = c.lower()
+        if "email" in cl:
+            emails.extend(split_multi(row.get(c)))
+
+    # Telefones normalizados preferenciais
+    for c in ["telefone_1_full", "telefone_2_full", "telefones_norm"]:
+        if c in row:
+            phones.extend(split_multi(row.get(c)))
+
+    # Telefones brutos (ddd + tel) — normaliza para +55DDDTEL apenas se não existir acima
+    def norm_tel(ddd, tel):
+        d = re.sub(r"\D", "", s(ddd))
+        t = re.sub(r"\D", "", s(tel))
+        if not t:
+            return ""
+        if d and not t.startswith(d):
+            return f"+55{d}{t}"
+        return f"+55{t}" if not t.startswith("55") else f"+{t}"
+
+    if not phones:
+        d1, t1 = row.get("ddd_1"), row.get("telefone_1")
+        d2, t2 = row.get("ddd_2"), row.get("telefone_2")
+        cand = [norm_tel(d1, t1), norm_tel(d2, t2)]
+        phones.extend([x for x in cand if x])
+
+    # Limpa/dedup
+    emails = [e for e in emails if e]
+    phones = [p for p in phones if p]
+    emails = list(dict.fromkeys(emails))
+    phones = list(dict.fromkeys(phones))
+    return {"emails": emails, "phones": phones}
+
+# constroi dados
 def build_enriched_index(df_enr: Optional[pd.DataFrame], max_socios_in_json: int = 20) -> Dict[str, Any]:
+    """
+    Constrói índice por CNPJ com: razao_social, porte, capital_social,
+    lista de socios (strings ou dicts), e também emails[] e phones[].
+    """
     if df_enr is None or df_enr.empty:
         return {}
-    df_enr = df_enr.copy()
-    df_enr["cnpj"] = df_enr["cnpj"].astype(str)
 
-    cols = set(df_enr.columns)
-    if "nome_socio_razao_social" in cols:
-        socios_grp = (
-            df_enr[["cnpj", "nome_socio_razao_social"]]
-            .assign(nome_socio_razao_social=lambda d: d["nome_socio_razao_social"].astype(str).str.strip())
-            .query("nome_socio_razao_social != ''")
-            .groupby("cnpj")["nome_socio_razao_social"]
-            .apply(lambda serie: list(pd.unique(serie)))
-            .rename("socios_list")
-        )
-    else:
-        socios_grp = pd.Series(dtype=object, name="socios_list")
+    df = df_enr.copy()
+    df["cnpj"] = df["cnpj"].astype(str)
+
+    # Detect email / phone columns (heurística)
+    email_cols = [c for c in df.columns if "email" in c.lower()]
+    phone_cols = [c for c in df.columns if any(k in c.lower() for k in ("fone", "tel", "telefone", "phone"))]
+
+    has_socio_name = "nome_socio_razao_social" in df.columns
+    socio_email_cols = [c for c in email_cols if "socio" in c.lower() or "sócio" in c.lower()]
+    socio_phone_cols = [c for c in phone_cols if "socio" in c.lower() or "sócio" in c.lower()]
 
     def first_non_empty(serie: pd.Series) -> str:
         for v in serie:
@@ -91,33 +140,85 @@ def build_enriched_index(df_enr: Optional[pd.DataFrame], max_socios_in_json: int
                 return vv
         return ""
 
+    # Agregação básica (razao, porte, capital)
     agg = {}
-    if "porte_empresa_txt" in cols:
+    if "porte_empresa_txt" in df.columns:
         agg["porte_empresa_txt"] = first_non_empty
-    elif "porte_empresa" in cols:
+    elif "porte_empresa" in df.columns:
         agg["porte_empresa"] = first_non_empty
-    if "capital_social" in cols:
+    if "capital_social" in df.columns:
         agg["capital_social"] = first_non_empty
-    if "razao_social" in cols:
+    if "razao_social" in df.columns:
         agg["razao_social"] = first_non_empty
 
-    base_grp = df_enr.groupby("cnpj").agg(agg) if agg else pd.DataFrame(index=df_enr["cnpj"].unique())
-    enr = base_grp.join(socios_grp, how="left")
+    base_grp = df.groupby("cnpj").agg(agg) if agg else pd.DataFrame(index=df["cnpj"].unique())
 
+    def collect_unique(group, cols_to_check):
+        vals = []
+        for c in cols_to_check:
+            if c in group:
+                vals.extend([s(v).strip() for v in group[c].tolist() if s(v).strip()])
+        cleaned = []
+        for v in vals:
+            parts = re.split(r'[;,/]\s*', v)
+            for p in parts:
+                p = p.strip()
+                if p and p not in cleaned:
+                    cleaned.append(p)
+        return cleaned
+
+    emails_grp: Dict[str, List[str]] = {}
+    phones_grp: Dict[str, List[str]] = {}
+    socios_grp: Dict[str, List[Any]] = {}
+
+    for cnpj, group in df.groupby("cnpj"):
+        # company emails / phones
+        emails = collect_unique(group, email_cols) if email_cols else []
+        phones = collect_unique(group, phone_cols) if phone_cols else []
+
+        # sócios com possíveis contatos
+        socios_out = []
+        if has_socio_name:
+            for _, row in group.iterrows():
+                nome = s(row.get("nome_socio_razao_social")).strip()
+                if not nome:
+                    continue
+                socio = {"name": nome}
+                for ec in (socio_email_cols or email_cols):
+                    if ec in row and s(row.get(ec)).strip():
+                        socio.setdefault("emails", []).extend(split_multi(row.get(ec)))
+                for pc in (socio_phone_cols or phone_cols):
+                    if pc in row and s(row.get(pc)).strip():
+                        socio.setdefault("phones", []).extend(split_multi(row.get(pc)))
+                if "emails" in socio:
+                    socio["emails"] = list(dict.fromkeys([x for x in socio["emails"] if x]))
+                if "phones" in socio:
+                    socio["phones"] = list(dict.fromkeys([x for x in socio["phones"] if x]))
+                socios_out.append(socio)
+
+        emails = list(dict.fromkeys(emails))
+        phones = list(dict.fromkeys(phones))
+        emails_grp[str(cnpj)] = emails
+        phones_grp[str(cnpj)] = phones
+        socios_grp[str(cnpj)] = socios_out
+
+    enr = base_grp.copy()
     out: Dict[str, Any] = {}
-    for cnpj, row in enr.iterrows():
-        socios_list = row.get("socios_list", [])
-        if not isinstance(socios_list, (list, tuple)):
-            socios_list = []
-        n_soc = len(socios_list)
-        socios_short = socios_list[:max_socios_in_json] if n_soc > max_socios_in_json else socios_list
-        porte = s(row.get("porte_empresa_txt")) or s(row.get("porte_empresa"))
-        out[str(cnpj)] = {
+    keys = set(list(enr.index.astype(str)) + list(emails_grp.keys()) + list(phones_grp.keys()) + list(socios_grp.keys()))
+    for cnpj in keys:
+        row = enr.loc[cnpj] if cnpj in enr.index else {}
+        porte = s(row.get("porte_empresa_txt") if hasattr(row, "get") else row.get("porte_empresa") if hasattr(row, "get") else "")
+        out[cnpj] = {
             "porte": porte,
-            "capital_social": s(row.get("capital_social")),
-            "razao_social": s(row.get("razao_social")),
-            "n_socios": n_soc,
-            "socios": socios_short,
+            "capital_social": s(row.get("capital_social") if hasattr(row, "get") else ""),
+            "razao_social": s(row.get("razao_social") if hasattr(row, "get") else ""),
+            "emails": emails_grp.get(cnpj, []),
+            "phones": phones_grp.get(cnpj, []),
+            "n_socios": len(socios_grp.get(cnpj, [])) if socios_grp.get(cnpj, []) else int(s(row.get("n_socios")) or 0),
+            "socios": socios_grp.get(cnpj, []) or (
+                list(pd.unique(df[df["cnpj"] == cnpj]["nome_socio_razao_social"].dropna()))[:max_socios_in_json]
+                if "nome_socio_razao_social" in df.columns else []
+            ),
         }
     return out
 
@@ -145,17 +246,13 @@ def normalize_for_geocode(endereco_raw: str) -> Tuple[str, Optional[str]]:
     t = str(endereco_raw).upper().strip()
     for p in _PREFIXES:
         t = re.sub(rf'\b{p}(?=[A-Z0-9])', f'{p} ', t)
-    # "KM    148,8" -> "KM 148,8"
     t = re.sub(r'\bKM\s*([0-9]+[,\.]?[0-9]*)', r'KM \1', t)
-    # remove " - NN/UF - "
     t = re.sub(r'\s*-\s*\d{2}\s*/\s*[A-Z]{2}\s*-?', ' ', t)
-    # extrai CEP
     mcep = re.search(r'CEP\s*([0-9]{5}-?[0-9]{3})', t)
     cep: Optional[str] = None
     if mcep:
         cep = mcep.group(1)
         t = t[:mcep.start()] + t[mcep.end():]
-    # limpeza
     t = t.replace(' - ', ', ')
     t = re.sub(r'\s*,\s*', ', ', t)
     t = re.sub(r'\s{2,}', ' ', t).strip(' ,;-')
@@ -179,17 +276,12 @@ def point_in_bbox(lat: float, lon: float, bbox: Optional[Tuple[float, float, flo
     west, south, east, north = bbox
     return (south <= lat <= north) and (west <= lon <= east)
 
-def _addr_city_like(addr: Dict[str, str]) -> str:
-    return addr.get("city") or addr.get("town") or addr.get("municipality") or addr.get("village") or ""
-
 def is_valid_hit(loc, bbox: Optional[Tuple[float, float, float, float]]) -> bool:
-    """Se tenho bbox, aceito coordenada apenas por cair dentro dela (relaxa checagem textual)."""
     raw = getattr(loc, "raw", {}) or {}
     try:
         lat = float(loc.latitude); lon = float(loc.longitude)
     except Exception:
         return False
-    # recusa centroides óbvios se tivermos alternativa depois
     cls, typ = raw.get("class"), raw.get("type")
     is_boundary = (cls == "boundary") and (typ in {"administrative", "city", "town", "municipality"})
     if is_boundary and not bbox:
@@ -207,7 +299,6 @@ def build_candidates(endereco_raw: str, cidade: str, uf: str, country: str = "Br
         cands.append({"postalcode": cep, "city": cidade, "state": uf, "country": country})
     if base:
         cands.append(f"{base}, {cidade}, {uf}, {country}")
-    # de-dup
     seen = set(); uniq: List[Any] = []
     for q in cands:
         key = json.dumps(q, ensure_ascii=False, sort_keys=True) if isinstance(q, dict) else str(q)
@@ -218,7 +309,6 @@ def build_candidates(endereco_raw: str, cidade: str, uf: str, country: str = "Br
 def geocode_with_candidates(nominate, arcgis, candidates: List[Any],
                             bbox: Optional[Tuple[float, float, float, float]],
                             cidade: str, uf: str) -> Tuple[str, str, str, str, Dict[str, Any]]:
-    """Tenta Nominatim, depois ArcGIS. Retorna (lat, lon, provider, display_name, rawaddr)."""
     vb = None
     if bbox:
         west, south, east, north = bbox
@@ -247,7 +337,6 @@ def geocode_with_candidates(nominate, arcgis, candidates: List[Any],
                 continue
             lat, lon = float(loc.latitude), float(loc.longitude)
             if point_in_bbox(lat, lon, bbox):
-                # ArcGIS não expõe addressdetails do OSM, guardo raw mínimo
                 return (f"{lat}", f"{lon}", "arcgis",
                         getattr(loc, "address", ""), {"provider": "arcgis"})
         except Exception:
@@ -315,7 +404,6 @@ def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
             if not tmp.empty:
                 geocache = pd.concat([geocache, tmp], ignore_index=True)
                 novos = []
-            # salva parciais de log
             if succ_rows:
                 pd.DataFrame(succ_rows).to_csv("geocode_success.csv", index=False)
             if fail_rows:
@@ -325,7 +413,6 @@ def geocode_addresses(df_base: pd.DataFrame, geocache: pd.DataFrame,
     if novos:
         geocache = pd.concat([geocache, pd.DataFrame(novos)], ignore_index=True)
 
-    # dumps finais de log
     if succ_rows:
         pd.DataFrame(succ_rows).to_csv("geocode_success.csv", index=False)
     if fail_rows:
@@ -403,6 +490,15 @@ def main():
         if (not keep_missing) and (lat == "" or lon == ""):
             continue
 
+        # Contatos vindos do enriquecido (preferência) + fallback da base/row
+        enr_info = enr_idx.get(cnpj, {})
+        emails_from_enr = list(enr_info.get("emails", []) or [])
+        phones_from_enr = list(enr_info.get("phones", []) or [])
+
+        fallback_contacts = collect_contacts_from_row(r)
+        emails = list(dict.fromkeys(emails_from_enr + fallback_contacts.get("emails", [])))
+        phones = list(dict.fromkeys(phones_from_enr + fallback_contacts.get("phones", [])))
+
         item: Dict[str, Any] = {
             "cnpj": cnpj,
             "cnpj_formatado": format_cnpj(cnpj),
@@ -411,16 +507,18 @@ def main():
             "latitude": float(lat) if lat else None,
             "longitude": float(lon) if lon else None,
             "query_geocode": s(r.get("query", "")),
+            # NOVOS CAMPOS:
+            "emails": emails,
+            "phones": phones,
         }
 
-        if cnpj in enr_idx:
-            info = enr_idx[cnpj]
+        if enr_info:
             item.update({
-                "razao_social": info.get("razao_social", ""),
-                "porte": info.get("porte", ""),
-                "capital_social": info.get("capital_social", ""),
-                "n_socios": int(info.get("n_socios", 0) or 0),
-                "socios": info.get("socios", []),
+                "razao_social": enr_info.get("razao_social", ""),
+                "porte": enr_info.get("porte", ""),
+                "capital_social": enr_info.get("capital_social", ""),
+                "n_socios": int(enr_info.get("n_socios", 0) or 0),
+                "socios": enr_info.get("socios", []),  # pode conter strings ou objetos {name, emails?, phones?}
             })
 
         data["features"].append(item)
@@ -431,4 +529,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
